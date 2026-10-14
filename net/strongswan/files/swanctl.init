@@ -951,6 +951,11 @@ config_strongswan_generate() {
 }
 
 prepare_env() {
+	is_legacy_config && {
+		legacy_prepare_env
+		return
+	}
+
 	mkdir -p /var/ipsec /var/swanctl
 
 	config_load ipsec
@@ -1032,11 +1037,6 @@ service_trigger_ipsec() {
 }
 
 start_service() {
-	is_legacy_config && {
-		legacy_prepare_env
-		return
-	}
-
 	prepare_env
 
 	[ $WAIT_FOR_INTF -eq 1 ] && return
