@@ -1,0 +1,508 @@
+Subject: [PATCH] pptpd: keep control and PPP process lifetimes owned
+
+Reject an excess call on a one-channel control connection without
+replacing its active call. Track every controller, including delegate
+mode, and retire controllers and the broadcast relay before exit. Keep
+PPP in its original child process and reap it before releasing control.
+
+Adopt descendants on forced controller exit and retain an inherited
+exclusive instance lock through PPP and its scripts. A replacement cannot
+accept clients while the old native owners remain, even if procd's
+shutdown deadline forces the manager to exit. Lock acquisition failure
+is reported before creating a relay or listener.
+
+--- a/ctrlpacket.c
++++ b/ctrlpacket.c
+@@ -420,17 +420,15 @@
+         out_call_rqst = (struct pptp_out_call_rqst *) packet;
+ 
+         if ((pac_call_id = getcall()) == htons(-1)) {
+-                /* XXX should reject call */
+-                syslog(LOG_ERR, "CTRL: No free Call IDs!");
+-                pac_call_id = 0;
++                syslog(LOG_WARNING, "CTRL: Rejecting additional call on an occupied control connection");
+         }
+         MAKE_CTRL_HEADER(out_call_rply, OUT_CALL_RPLY);
+         /* call_id is used for ctrl, call_id_peer is used for GRE
+          * call_id_peer is what we were sent by the other end in ctrl initilization
+          */
+-        out_call_rply.call_id = pac_call_id;
++        out_call_rply.call_id = (pac_call_id == htons(-1)) ? 0 : pac_call_id;
+         out_call_rply.call_id_peer = out_call_rqst->call_id;
+-        out_call_rply.result_code = CONNECTED;
++        out_call_rply.result_code = (pac_call_id == htons(-1)) ? DO_NOT_ACCEPT : CONNECTED;
+         out_call_rply.error_code = NO_ERROR;
+         out_call_rply.cause_code = NO_ERROR;
+         /* maybe limit to pppd speed? but pppd doesn't accept 10Mbps as a speed and yet
+@@ -676,7 +674,7 @@
+                 _pac_init = 1;
+         }
+         if(_pac_call_id != htons(-1))
+-                syslog(LOG_ERR, "CTRL: Asked to allocate call id when call open, not handled well");
++                return htons(-1);
+         _pac_call_id = htons(i);
+         i++;
+         return _pac_call_id;
+--- a/pptpctrl.c
++++ b/pptpctrl.c
+@@ -51,6 +51,9 @@
+ #include "defaults.h"
+ // placing net/if.h here fixes build on Solaris
+ #include <net/if.h>
++#ifdef __linux__
++#include <sys/prctl.h>
++#endif
+ 
+ #ifdef VRF
+ char *vrf = NULL;
+@@ -80,6 +83,7 @@
+ 
+ /* Local function prototypes */
+ static void bail(int sigraised);
++static void stop_pppd(void);
+ static void pptp_handle_ctrl_connection(char **pppaddrs, struct in_addr *inetaddrs);
+ 
+ static int startCall(char **pppaddrs, struct in_addr *inetaddrs);
+@@ -138,8 +142,14 @@
+         /* open a connection to the syslog daemon */
+         openlog("pptpd", LOG_PID, PPTP_FACILITY);
+ 
+-        /* autoreap if supported */
+-        signal(SIGCHLD, SIG_IGN);
++        /* Retain the child identity until stop_pppd() explicitly reaps it. */
++        signal(SIGCHLD, SIG_DFL);
++#ifdef __linux__
++        if (prctl(PR_SET_CHILD_SUBREAPER, 1) < 0) {
++                syslog_perror("PR_SET_CHILD_SUBREAPER");
++                return 1;
++        }
++#endif
+ 
+         /* note: update pptpctrl.8 if the argument list format is changed */
+         GETARG_INT(pptpctrl_debug);
+@@ -216,8 +226,7 @@
+         syslog(LOG_INFO, "CTRL: Client %s control connection started", inet_ntoa(addr.sin_addr));
+         pptp_handle_ctrl_connection(pppaddrs, inetaddrs);
+         syslog(LOG_DEBUG, "CTRL: Reaping child PPP[%i]", pppfork);
+-        if (pppfork > 0)
+-                waitpid(pppfork, NULL, 0);
++        stop_pppd();
+         syslog(LOG_INFO, "CTRL: Client %s control connection finished", inet_ntoa(addr.sin_addr));
+ 
+         bail(0);                /* NORETURN */
+@@ -378,6 +387,12 @@
+                                 goto leave_drop_call;
+ 
+                         case OUT_CALL_RQST:
++                                /* The advertised limit is one call per control
++                                 * connection. A rejected request must not replace
++                                 * the active call's IDs, GRE socket or PPP owner.
++                                 */
++                                if (rply_packet->result_code != CONNECTED)
++                                        break;
+                                 /* for killing off the link later (ugly) */
+                                 NOTE_VALUE(PAC, call_id_pair, rply_packet->call_id);
+                                 NOTE_VALUE(PNS, call_id_pair, rply_packet->call_id_peer);
+@@ -476,18 +491,44 @@
+ }
+ 
+ 
+-/*
+- * This is the custom exit() for this program.
+- *
+- * Updated to also be the default SIGTERM handler, and if
+- * the link is going down for unnatural reasons, we will close it
+- * right now, it's only been tested for win98, other tests would be nice
+- * -tmk
+- */
++/* Reap the exact PPP owner before a controller or its address slot is released. */
++static void stop_pppd(void)
++{
++        int i, status;
++        pid_t result;
++
++        if (pppfork <= 0)
++                return;
++        result = waitpid(pppfork, &status, WNOHANG);
++        if (result == pppfork || (result < 0 && errno == ECHILD))
++                goto done;
++
++        kill(pppfork, SIGTERM);
++        for (i = 0; i < 30; i++) {
++                result = waitpid(pppfork, &status, WNOHANG);
++                if (result == pppfork || (result < 0 && errno == ECHILD))
++                        goto done;
++                usleep(100000);
++        }
++        kill(pppfork, SIGKILL);
++        while (waitpid(pppfork, &status, 0) < 0 && errno == EINTR)
++                ;
++done:
++        /* pppd can time out waiting for down scripts or be killed above.
++         * As their subreaper, retain this call's slot until they also exit.
++         */
++        while (waitpid(-1, &status, 0) >= 0 || errno == EINTR)
++                ;
++        pppfork = 0;
++}
++
++/* Common normal/error/SIGTERM exit path for the control connection. */
+ static void bail(int sigraised)
+ {
+         if (sigraised)
+                 syslog(LOG_INFO, "CTRL: Exiting on signal %d", sigraised);
++
++        stop_pppd();
+ 
+         /* send a disconnect to the other end */
+         /* ignore any errors */
+@@ -554,7 +595,10 @@
+         if (pptpctrl_debug)
+                 syslog(LOG_DEBUG, "CTRL: Exiting now");
+ 
+-        exit((GET_VALUE(PAC, call_id_pair) == htons(-1)) ? 0 : 1);
++        /* The manager needs completion of the local owner, not the remote
++         * transport outcome. stop_pppd() has also drained this call's hooks.
++         */
++        exit(0);
+ }
+ 
+ /*
+@@ -620,6 +664,7 @@
+                 syslog(LOG_DEBUG, "CTRL: tty_fd = %d", tty_fd);
+         }
+         /* Launch the PPPD  */
++        pid_t controller_pid = getpid();
+ #ifndef HAVE_FORK
+         switch(pppfork=vfork()){
+ #else
+@@ -630,6 +675,12 @@
+                 _exit(1);
+ 
+         case 0:         /* child */
++                signal(SIGTERM, SIG_DFL);
++#ifdef __linux__
++                if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 ||
++                    getppid() != controller_pid)
++                        _exit(1);
++#endif
+                 if (dup2(tty_fd, 0) == -1) {
+                   syslog(LOG_ERR, "CTRL: child tty_fd dup2 to stdin, %s",
+                          strerror(errno));
+@@ -681,7 +732,7 @@
+  */
+ static void launch_pppd(char **pppaddrs, struct in_addr *inetaddrs)
+ {
+-        char *pppd_argv[16];
++        char *pppd_argv[20];
+         int an = 0;
+         sigset_t sigs;
+         char pppInterfaceIPs[33];
+@@ -803,6 +854,12 @@
+ 
+         pppd_argv[an++] = "remotenumber";
+         pppd_argv[an++] = inet_ntoa(inetaddrs[1]);
++        /* Keep the exact child PID so stop/reload can retire PPP before the
++         * controller exits and its address slot is reused.
++         */
++        pppd_argv[an++] = "nodetach";
++        pppd_argv[an++] = "lcp-max-terminate";
++        pppd_argv[an++] = "0";
+ #endif
+ 
+         /* argv arrays must always be NULL terminated */
+@@ -817,4 +874,3 @@
+                "CTRL (PPPD Launcher): Failed to launch PPP daemon. %s",
+                strerror(errno));
+ }
+-
+--- a/pptpmanager.c
++++ b/pptpmanager.c
+@@ -30,6 +30,9 @@
+ #include <time.h>
+ #include <sys/time.h>
+ #include <fcntl.h>
++#ifdef __linux__
++#include <sys/prctl.h>
++#endif
+ #ifdef VRF
+ #include <vrf.h>
+ #endif
+@@ -63,6 +66,9 @@
+ extern int pptp_noipparam;
+ extern int pptp_logwtmp;
+ extern int pptp_delegate;
++#ifdef BCRELAY
++extern pid_t bcrelayfork;
++#endif
+ 
+ /* option for timeout on starting ctrl connection */
+ extern int pptp_stimeout;
+@@ -75,6 +81,13 @@
+ 
+ /* this end's call identifier */
+ uint16_t unique_call_id = 0;
++
++/* Control processes remain children until reaped, including delegate mode. */
++static struct controller {
++        struct controller *next;
++        pid_t pid;
++} *controllers;
++static int retire_manager;
+ 
+ /* slots - begin */
+ 
+@@ -187,6 +200,23 @@
+   int child, status;
+ 
+   while ((child = waitpid(-1, &status, WNOHANG)) > 0) {
++#ifdef BCRELAY
++    if (child == bcrelayfork)
++      bcrelayfork = 0;
++#endif
++    struct controller **entry = &controllers;
++    while (*entry && (*entry)->pid != child)
++      entry = &(*entry)->next;
++    if (*entry) {
++      struct controller *old = *entry;
++      *entry = old->next;
++      free(old);
++      if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
++        /* Its adopted PPP/scripts may still own the address slot. */
++        syslog(LOG_ERR, "MGR: Control process %d exited without confirmed retirement; stopping admissions", child);
++        retire_manager = 1;
++      }
++    }
+     if (pptp_delegate) {
+       if (pptp_debug) syslog(LOG_DEBUG, "MGR: Reaped child %d", child);
+     } else {
+@@ -202,8 +232,53 @@
+   }
+ }
+ 
++static void stop_controllers(void)
++{
++        struct controller *entry;
++        int i, status;
++
++        sigchld_responder(SIGCHLD);
++#ifdef BCRELAY
++        if (bcrelayfork > 0)
++                kill(bcrelayfork, SIGTERM);
++#endif
++        for (entry = controllers; entry; entry = entry->next)
++                kill(entry->pid, SIGTERM);
++
++        /* Each controller first retires its PPP child, then closes control.
++         * Bound unresponsive control peers before the manager can restart.
++         */
++        for (i = 0; i < 100; i++) {
++                if (!controllers
++#ifdef BCRELAY
++                    && !bcrelayfork
++#endif
++                   )
++                        break;
++                usleep(100000);
++                sigchld_responder(SIGCHLD);
++        }
++        for (entry = controllers; entry; entry = entry->next)
++                kill(entry->pid, SIGKILL);
++#ifdef BCRELAY
++        if (bcrelayfork > 0)
++                kill(bcrelayfork, SIGKILL);
++#endif
++        /* As subreaper, include PPP and scripts adopted from a forced exit.
++         * If procd's deadline expires, the inherited instance lock still
++         * prevents a replacement from accepting clients before they finish.
++         */
++        while (waitpid(-1, &status, 0) >= 0 || errno == EINTR)
++                ;
++        while ((entry = controllers)) {
++                controllers = entry->next;
++                free(entry);
++        }
++}
++
+ int pptp_manager(int argc, char **argv)
+ {
++        pid_t manager_pid = getpid();
+         int firstOpen = -1;
+         int ctrl_pid;
+         socklen_t addrsize;
+@@ -217,6 +292,7 @@
+         if (rc < 0) {
+                 syslog(LOG_ERR, "MGR: unable to setup sigchld pipe!");
+                 syslog_perror("sigpipe_create");
++                stop_controllers();
+                 exit(-1);
+         }
+         
+@@ -237,6 +313,7 @@
+         if (createHostSocket(&hostSocket) < 0) {
+                 syslog(LOG_ERR, "MGR: Couldn't create host socket");
+                 syslog_perror("createHostSocket");
++                stop_controllers();
+                 exit(-1);
+         }
+ 
+@@ -263,6 +340,8 @@
+                         if (errno == EINTR) continue;
+                         syslog(LOG_ERR, "MGR: Error with manager select()!");
+                         syslog_perror("select");
++                        close(hostSocket);
++                        stop_controllers();
+                         exit(-1);
+                 }
+ 
+@@ -270,8 +349,16 @@
+                         int signum = sigpipe_read();
+                         if (signum == SIGCHLD)
+                                 sigchld_responder(signum);
+-                        else if (signum == SIGTERM)
++                        else if (signum == SIGTERM) {
++                                close(hostSocket);
++                                stop_controllers();
+                                 return signum;
++                        }
++                        if (retire_manager) {
++                                close(hostSocket);
++                                stop_controllers();
++                                return SIGCHLD;
++                        }
+                 }
+ 
+                 if (FD_ISSET(hostSocket, &connSet)) {   /* A call came! */
+@@ -368,6 +455,12 @@
+                                         continue;
+                                 }
+ 
++                                struct controller *controller = malloc(sizeof(*controller));
++                                if (!controller) {
++                                        syslog(LOG_ERR, "MGR: Unable to track a new control process");
++                                        close(clientSocket);
++                                        continue;
++                                }
+ #ifndef HAVE_FORK
+                                 switch (ctrl_pid = vfork()) {
+ #else
+@@ -376,9 +469,16 @@
+                                 case -1:        /* error */
+                                         syslog(LOG_ERR, "MGR: fork() failed launching " PPTP_CTRL_BIN);
+                                         close(clientSocket);
++                                        free(controller);
+                                         break;
+ 
+                                 case 0: /* child */
++                                        signal(SIGTERM, SIG_DFL);
++#ifdef __linux__
++                                        if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 ||
++                                            getppid() != manager_pid)
++                                                _exit(1);
++#endif
+                                         close(hostSocket);
+                                         if (pptp_debug)
+                                                 syslog(LOG_DEBUG, "MGR: Launching " PPTP_CTRL_BIN " to handle client");
+@@ -386,6 +486,9 @@
+                                         _exit(1);
+                                         /* NORETURN */
+                                 default:        /* parent */
++                                        controller->pid = ctrl_pid;
++                                        controller->next = controllers;
++                                        controllers = controller;
+                                         close(clientSocket);
+                                         unique_call_id += MAX_CALLS_PER_TCP_LINK;
+                                         if (!pptp_delegate)
+--- a/pptpd.c
++++ b/pptpd.c
+@@ -25,6 +25,7 @@
+ #include "our_getopt.h"
+ 
+ #include <fcntl.h>
++#include <errno.h>
+ #include <netdb.h>
+ #include <signal.h>
+ #include <stdio.h>
+@@ -36,7 +37,11 @@
+ #include <arpa/inet.h>
+ #include <sys/wait.h>
+ #include <sys/stat.h>
++#include <sys/file.h>
+ #include <unistd.h>
++#ifdef __linux__
++#include <sys/prctl.h>
++#endif
+ 
+ #include "configfile.h"
+ #include "defaults.h"
+@@ -79,8 +84,36 @@
+ 
+ #ifdef BCRELAY
+ static void launch_bcrelay();
+-static pid_t bcrelayfork;
+-#endif
++pid_t bcrelayfork;
++#endif
++
++/* The open file description is inherited by controllers, PPP and its scripts.
++ * A forced parent exit must not let a new manager reuse their addresses.
++ */
++static int lock_instance(const char *pid_file)
++{
++        char *path;
++        int fd, i;
++
++        path = malloc(strlen(pid_file) + sizeof(".lock"));
++        if (!path)
++                return -1;
++        sprintf(path, "%s.lock", pid_file);
++        fd = open(path, O_RDWR | O_CREAT, 0600);
++        free(path);
++        if (fd < 0)
++                return -1;
++
++        for (i = 0; i < 100; i++) {
++                if (!flock(fd, LOCK_EX | LOCK_NB))
++                        return 0;
++                if (errno != EWOULDBLOCK && errno != EINTR)
++                        break;
++                usleep(100000);
++        }
++        close(fd);
++        return -1;
++}
+ 
+ static void showusage(char *prog)
+ {
+@@ -430,6 +463,17 @@
+ #endif
+         }
+ 
++        if (lock_instance(pid_file) < 0) {
++                syslog(LOG_ERR, "MGR: Unable to acquire instance lock; previous descendants may still be active");
++                return 1;
++        }
++#ifdef __linux__
++        if (prctl(PR_SET_CHILD_SUBREAPER, 1) < 0) {
++                syslog_perror("PR_SET_CHILD_SUBREAPER");
++                return 1;
++        }
++#endif
++
+ #ifdef BCRELAY
+       if (bcrelay) {
+              syslog(LOG_DEBUG, "CTRL: BCrelay incoming interface is %s", bcrelay);
+@@ -462,13 +506,6 @@
+         /* manage connections until SIGTERM */
+         pptp_manager(argc, argv);
+         
+-#ifdef BCRELAY
+-        if (bcrelayfork > 0) {
+-                syslog(LOG_DEBUG, "CTRL: Closing child BCrelay with pid %i", bcrelayfork);
+-                kill(bcrelayfork, SIGTERM);
+-        }
+-#endif
+-
+         slot_free();
+         return 0;
+ }

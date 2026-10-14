@@ -11,6 +11,15 @@ function section_exists(name) {
 	return (system(cmd) == 0)
 }
 
+function option_enabled(name, option, cmd, value, extra, result) {
+	cmd = "uci -q get openvpn." name "." option
+	result = (cmd | getline value)
+	if (result != 1 || (cmd | getline extra) > 0)
+		value = ""
+	close(cmd)
+	return value ~ /^(1|on|true|yes|enabled)$/ ? 1 : 0
+}
+
 BEGIN {
 	in_section=0
 	secname = ""
@@ -31,6 +40,7 @@ BEGIN {
 	sub(/^config[ \t]+openvpn/, "config interface")
 	print
 	print "\toption proto '\''openvpn'\''"
+	print "\toption auto '\''" (option_enabled(secname, "enable") || option_enabled(secname, "enabled")) "'\''"
 	next
 }
 
@@ -43,6 +53,11 @@ BEGIN {
 in_section && /^[ \t]*option[ \t]+proto[ \t]/ {
 	sub(/option[ \t]+proto/, "option ovpnproto")
 	print
+	next
+}
+
+# The legacy enable flags have been translated to netifd auto.
+in_section && /^[ \t]*option[ \t]+enable(d)?[ \t]/ {
 	next
 }
 

@@ -4,5 +4,13 @@
 START=99
 
 start() {
-    /usr/bin/wifi_schedule.sh startup
+    if [ "$PKG_UPGRADE" = 1 ]; then
+        /usr/bin/wifi_schedule.sh cron-only
+    else
+        /usr/bin/wifi_schedule.sh startup
+    fi
+}
+
+reload() {
+    /usr/bin/wifi_schedule.sh cron
 }

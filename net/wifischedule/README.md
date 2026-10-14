@@ -23,8 +23,21 @@ Regarding 3: E.g. in a company, why would wireless need to be enabled weekends i
 Or think of an accesspoint in your kids room when you want the youngsters to sleep after 10 pm instead of facebooking...
 
 ## Configuration
-You can create an arbitrary number of schedule events. Please note that there is on sanity check done wheather the start / stop times overlap or make sense.
-If start and stop time are equal, this leads to disabling the WiFi at the given time.
+You can create an arbitrary number of schedule events. WiFi remains allowed while
+any enabled time window is active. An overnight window belongs to its starting
+weekday; its stop occurs the following day, including Sunday-to-Monday rollover.
+Times may use one or two digits for hours and minutes. If start and stop time are
+equal, the entry is a stop-only event and does not create an allow window.
+
+Scheduled jobs recheck the current global setting, entry and force policy before
+acting. Deleted or disabled entries cannot act through an old cron job. Force
+overrides associated clients, not another active allow window. Manual Start,
+Stop and ForceStop commands remain available with scheduling disabled; a pending
+manual graceful stop retains that ownership when it rechecks.
+
+Package upgrades rebuild cron jobs using current section identities without
+changing radio state. Explicit pending rechecks survive and revalidate their
+owners when they run. Legacy retries without an owner are discarded.
 
 Logging if enabled is done to the file `/var/log/wifi_schedule.log` and can be reviewed through the "View Logfile" tab.
 The cron jobs created can be reviewed through the "View Cron Jobs" tab.
@@ -74,9 +87,10 @@ Then call the script as follows in order to get the necessary cron jobs created:
 All commands:
  
 ```
-wifi_schedule.sh cron|start|startup|stop|forcestop|recheck|getmodules|savemodules|help
+wifi_schedule.sh cron|cron-only|start|startup|stop|forcestop|recheck|getmodules|savemodules|help
 
     cron: Create cronjob entries.
+    cron-only: Rebuild cron jobs without changing the current radio state.
     start: Start wifi.
     startup: Checks current timewindow and enables/disables WIFI accordingly.
     stop: Stop wifi gracefully, i.e. check if there are stations associated and if so keep retrying.
@@ -89,3 +103,11 @@ wifi_schedule.sh cron|start|startup|stop|forcestop|recheck|getmodules|savemodule
 
 ## Startup Script: `/etc/init.d/wifi_schedule`
 Makes sure time window is checked and WIFI is enabled or disabled accordingly when powering on the router.
+
+## Tests
+
+Run the pure time/day boundary cases with `busybox ash tests/time.sh`. The public
+CLI cases run through `sh tests/run-dispatch.sh IMAGE`, where IMAGE supplies Bash,
+Python 3 and standard text tools. The runner mounts the product files unchanged
+and substitutes external commands in a container without network access; it
+cannot modify host or router radios, UCI, crontabs or locks.

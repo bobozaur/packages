@@ -1,12 +1,15 @@
 #!/bin/sh
 
-IP4="ip -4"
-IP6="ip -6"
+IP4="ip -4 -N"
+IP6="ip -6 -N"
 SCRIPTNAME="$(basename "$0")"
 
 MWAN3_STATUS_DIR="/var/run/mwan3"
 MWAN3_STATUS_IPTABLES_LOG_DIR="${MWAN3_STATUS_DIR}/iptables_log"
 MWAN3TRACK_STATUS_DIR="/var/run/mwan3track"
+
+# Reserved route/rule protocol. Untagged legacy state is never adopted by range.
+MWAN3_ROUTE_PROTOCOL=201
 
 MWAN3_INTERFACE_MAX=""
 
@@ -165,7 +168,7 @@ mwan3_init()
 	[ -d "$MWAN3_STATUS_IPTABLES_LOG_DIR" ] || mkdir -p "$MWAN3_STATUS_IPTABLES_LOG_DIR"
 
 	# mwan3's MARKing mask (at least 3 bits should be set)
-	if [ -e "${MWAN3_STATUS_DIR}/mmx_mask" ]; then
+	if { [ -e "${MWAN3_STATUS_DIR}/owned" ] || [ -e "${MWAN3_STATUS_DIR}/retired" ]; } && [ -e "${MWAN3_STATUS_DIR}/mmx_mask" ]; then
 		readfile MMX_MASK "${MWAN3_STATUS_DIR}/mmx_mask"
 		MWAN3_INTERFACE_MAX=$(uci_get_state mwan3 globals iface_max)
 	else
@@ -180,10 +183,28 @@ mwan3_init()
 		LOG debug "Max interface count is ${MWAN3_INTERFACE_MAX}"
 	fi
 
+	# Numeric dumps keep table/protocol ownership unambiguous, but ip route
+	# mutations accept a leading route type only in its keyword form.
+	# Canonical unicast has no prefix; unknown types remain visible errors.
+	local route_types="
+s/^1[[:space:]]//
+s/^unicast[[:space:]]//
+s/^2[[:space:]]/local /
+s/^3[[:space:]]/broadcast /
+s/^4[[:space:]]/anycast /
+s/^5[[:space:]]/multicast /
+s/^6[[:space:]]/blackhole /
+s/^7[[:space:]]/unreachable /
+s/^8[[:space:]]/prohibit /
+s/^9[[:space:]]/throw /
+s/^10[[:space:]]/nat /
+s/^11[[:space:]]/xresolve /
+s/^12[[:space:]]/failed_policy /
+"
 	# remove "linkdown", expiry and source based routing modifiers from route lines
 	config_get_bool source_routing globals source_routing 0
 	[ $source_routing -eq 1 ] && unset source_routing
-	MWAN3_ROUTE_LINE_EXP="s/offload//; s/linkdown //; s/expires [0-9]\+sec//; s/error [0-9]\+//; ${source_routing:+s/default\(.*\) from [^ ]*/default\1/;} p"
+	MWAN3_ROUTE_LINE_EXP="${route_types}s/ proto [^ ]*//; s/offload//; s/linkdown //; s/expires [0-9]\+sec//; s/error [0-9]\+//; ${source_routing:+s/default\(.*\) from [^ ]*/default\1/;} s/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//; p"
 
 	# mark mask constants
 	bitcnt=$(mwan3_count_one_bits MMX_MASK)

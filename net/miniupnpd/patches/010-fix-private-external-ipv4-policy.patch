@@ -1,0 +1,36 @@
+Subject: [PATCH] Honor the private external IPv4 policy in SOAP and recovery
+
+GetExternalIPAddress retains a private address when it is forbidden and clears
+it when ext_allow_private_ipv4 is enabled. Match the option's startup, event
+notification and NAT-PMP checks by keeping an allowed private address.
+
+An interface lookup failure also disables port forwarding. Allow recovery when
+the returning address is private and explicitly permitted, as well as when it
+is public. Keep forwarding disabled while the interface is unavailable or its
+private address is forbidden. Describe either permitted address as external in
+the recovery log.
+
+--- a/upnpsoap.c
++++ b/upnpsoap.c
+@@ -370,7 +370,7 @@ GetExternalIPAddress(struct upnphttp * h, const char * action, const char * ns)
+ 				ext_if_name);
+ 			ext_ip_addr[0] = '\0';
+ 		} else if (addr_is_reserved(&addr)) {
+-			if (!GETFLAG(ALLOWPRIVATEIPV4MASK)) {
++			if (GETFLAG(ALLOWPRIVATEIPV4MASK)) {
+ 				syslog(LOG_WARNING, "IGNORED : private/reserved address %s is not suitable for external IP", ext_ip_addr);
+ 			} else {
+ 				syslog(LOG_NOTICE, "private/reserved address %s is not suitable for external IP", ext_ip_addr);
+--- a/miniupnpd.c
++++ b/miniupnpd.c
+@@ -1193,8 +1193,8 @@ static void update_disable_port_forwarding(void)
+ 				syslog(LOG_INFO, "Public IP address is required by UPnP/PCP/PMP protocols and clients do not work without it");
+ 				disable_port_forwarding = 1;
+ 			}
+-		} else if (disable_port_forwarding && !reserved) {
+-			syslog(LOG_INFO, "Public IP address %s on ext interface %s: Port forwarding is enabled", if_addr, ext_if_name);
++		} else if (disable_port_forwarding && (!reserved || GETFLAG(ALLOWPRIVATEIPV4MASK))) {
++			syslog(LOG_INFO, "External IP address %s on ext interface %s: Port forwarding is enabled", if_addr, ext_if_name);
+ 			disable_port_forwarding = 0;
+ 		}
+ 	}

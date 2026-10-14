@@ -46,6 +46,15 @@ parse_cidr6() {
 case "$script_type" in
 	up)
 		nohostroute="$(uci_get network "$INTERFACE" nohostroute)"
+		# --ifconfig-noexec leaves MTU configuration to this hook too. The
+		# protocol notification has no top-level MTU attribute; apply the
+		# daemon's effective tun_mtu before publishing the L3 device as up.
+		if [ -n "$tun_mtu" ]; then
+			ip link set dev "$dev" mtu "$tun_mtu" || {
+				logger -t "openvpn(proto)" -p daemon.err "Unable to set $dev MTU to $tun_mtu"
+				exit 1
+			}
+		fi
 		proto_init_update "$dev" 1
 
 		[ -n "$ifconfig_local" ] && proto_add_ipv4_address "$ifconfig_local" "${ifconfig_netmask:-255.255.255.255}"
@@ -99,8 +108,6 @@ case "$script_type" in
 				proto_add_ipv6_route "$v6net" "$v6plen" "$gw"
 			done
 		fi
-
-		[ -n "$tun_mtu" ] && json_add_int mtu "$tun_mtu"
 
 		i=0
 		while :; do

@@ -9,7 +9,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mwan3
 PKG_VERSION:=2.12.2
-PKG_RELEASE:=1
+PKG_RELEASE:=7
 
 PKG_MAINTAINER:=Florian Eckert <fe@dev.tdt.de>
 PKG_LICENSE:=GPL-2.0
@@ -28,7 +28,7 @@ define Package/mwan3
      +IPV6:ip6tables \
      +iptables-mod-conntrack-extra \
      +iptables-mod-ipopt \
-     +rpcd-mod-ucode \
+     +rpcd-mod-ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-ubus \
      +jshn
    TITLE:=Multiwan hotplug script with connection tracking support
    MAINTAINER:=Florian Eckert <fe@dev.tdt.de>
@@ -72,6 +72,8 @@ define Build/Compile
 endef
 
 define Package/mwan3/install
+	$(INSTALL_DIR) $(1)/etc/iproute2/rt_protos.d
+	$(INSTALL_DATA) ./files/mwan3-protocol.conf $(1)/etc/iproute2/rt_protos.d/mwan3.conf
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/etc/config/mwan3 \
 		$(1)/etc/config/

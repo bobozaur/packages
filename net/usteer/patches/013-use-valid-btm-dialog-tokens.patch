@@ -1,0 +1,127 @@
+Subject: [PATCH] usteer: use valid BTM tokens and native ubus event widths
+
+A zero BTM dialog token is discarded by stations without a response.
+Allocate nonzero tokens per station/BSS request, skipping zero on wrap,
+and include the token in the existing request log. Both advisory and
+imminent-disassociation band-steering paths use the same allocation.
+
+Consume hostapd query tokens and response codes at their native INT32
+widths, validating octet ranges before narrowing. Keep query tokens and
+the existing response policy instead of dropping events on a type mismatch.
+
+---
+
+--- a/usteer.h
++++ b/usteer.h
+@@ -262,6 +262,7 @@
+ 
+ 	uint8_t rrm;
+ 	bool bss_transition;
++	uint8_t bss_transition_dialog_token;
+ 	bool mbo;
+ 
+ 	enum roam_trigger_state roam_state;
+--- a/band_steering.c
++++ b/band_steering.c
+@@ -121,6 +121,11 @@
+ 			continue;
+ 
+ 		if (si->bss_transition) {
++			/* Zero is reserved and causes stations to discard the request.
++			 * Keep the token with this station/BSS owner and skip it on wrap.
++			 */
++			if (!++si->bss_transition_dialog_token)
++				si->bss_transition_dialog_token++;
+ 			si->roam_transition_request_validity_end = current_time + 10000;
+ 			validity_period = 10000 / usteer_local_node_get_beacon_interval(ln); /* ~ 10 seconds */
+ 			if (si->sta->aggressiveness >= 2) {
+@@ -130,9 +135,9 @@
+ 					disassoc_timer = (si->kick_time - current_time) / usteer_local_node_get_beacon_interval(ln);
+ 				else
+ 					disassoc_timer = 0;
+-				usteer_ubus_band_steering_request(si, 0, true, disassoc_timer, true, validity_period);
++				usteer_ubus_band_steering_request(si, si->bss_transition_dialog_token, true, disassoc_timer, true, validity_period);
+ 			} else
+-				usteer_ubus_band_steering_request(si, 0, false, 0, true, validity_period);
++				usteer_ubus_band_steering_request(si, si->bss_transition_dialog_token, false, 0, true, validity_period);
+ 		}
+ 
+ 		si->band_steering.below_snr = false;
+--- a/ubus.c
++++ b/ubus.c
+@@ -746,7 +746,7 @@
+ 	}
+ 	blobmsg_close_array(&b, c);
+ 	if (sizeof(si->node) > 0) {
+-		MSG(VERBOSE, "band steering station " MAC_ADDR_FMT " disassociation timer %u, signal %d\n", MAC_ADDR_DATA(si->sta->addr), disassoc_timer, si->signal);
++		MSG(VERBOSE, "band steering station " MAC_ADDR_FMT " disassociation timer %u, signal %d, dialog token %u\n", MAC_ADDR_DATA(si->sta->addr), disassoc_timer, si->signal, dialog_token);
+ 		return ubus_invoke(ubus_ctx, ln->obj_id, "bss_transition_request", b.head, NULL, 0, 100);
+ 	} else
+ 		MSG(VERBOSE, "band steering no targets found for station " MAC_ADDR_FMT "\n", MAC_ADDR_DATA(si->sta->addr));
+--- a/local_node.c
++++ b/local_node.c
+@@ -113,23 +113,28 @@
+ 	};
+ 	struct blobmsg_policy policy[__BSS_TM_QUERY_MAX] = {
+ 		[BSS_TM_QUERY_ADDRESS] = { .name = "address", .type = BLOBMSG_TYPE_STRING },
+-		[BSS_TM_QUERY_DIALOG_TOKEN] = { .name = "dialog-token", .type = BLOBMSG_TYPE_INT8 },
++		[BSS_TM_QUERY_DIALOG_TOKEN] = { .name = "dialog-token", .type = BLOBMSG_TYPE_INT32 },
+ 		[BSS_TM_QUERY_CANDIDATE_LIST] = { .name = "candidate-list", .type = BLOBMSG_TYPE_STRING },
+ 	};
+ 	struct blob_attr *tb[__BSS_TM_QUERY_MAX];
+ 	struct usteer_bss_tm_query *query;
+ 	uint8_t *sta_addr;
++	uint32_t dialog_token;
+ 
+ 	blobmsg_parse(policy, __BSS_TM_QUERY_MAX, tb, blob_data(msg), blob_len(msg));
+ 
+ 	if (!tb[BSS_TM_QUERY_ADDRESS] || !tb[BSS_TM_QUERY_DIALOG_TOKEN])
+ 		return 0;
+ 
++	dialog_token = blobmsg_get_u32(tb[BSS_TM_QUERY_DIALOG_TOKEN]);
++	if (!dialog_token || dialog_token > 255)
++		return 0;
++
+ 	query = calloc(1, sizeof(*query));
+ 	if (!query)
+ 		return 0;
+ 
+-	query->dialog_token = blobmsg_get_u8(tb[BSS_TM_QUERY_DIALOG_TOKEN]);
++	query->dialog_token = dialog_token;
+ 
+ 	sta_addr = (uint8_t *) ether_aton(blobmsg_get_string(tb[BSS_TM_QUERY_ADDRESS]));
+ 	if (!sta_addr) {
+@@ -155,18 +160,23 @@
+ 	};
+ 	struct blobmsg_policy policy[__BSS_TM_RESPONSE_MAX] = {
+ 		[BSS_TM_RESPONSE_ADDRESS] = { .name = "address", .type = BLOBMSG_TYPE_STRING },
+-		[BSS_TM_RESPONSE_STATUS_CODE] = { .name = "status-code", .type = BLOBMSG_TYPE_INT8 },
++		[BSS_TM_RESPONSE_STATUS_CODE] = { .name = "status-code", .type = BLOBMSG_TYPE_INT32 },
+ 	};
+ 	struct blob_attr *tb[__BSS_TM_RESPONSE_MAX];
+ 	struct sta_info *si;
+ 	struct sta *sta;
+ 	uint8_t *sta_addr;
++	uint32_t status_code;
+ 
+ 	blobmsg_parse(policy, __BSS_TM_RESPONSE_MAX, tb, blob_data(msg), blob_len(msg));
+ 
+ 	if (!tb[BSS_TM_RESPONSE_ADDRESS] || !tb[BSS_TM_RESPONSE_STATUS_CODE])
+ 		return 0;
+ 
++	status_code = blobmsg_get_u32(tb[BSS_TM_RESPONSE_STATUS_CODE]);
++	if (status_code > 255)
++		return 0;
++
+ 	sta_addr = (uint8_t *) ether_aton(blobmsg_get_string(tb[BSS_TM_RESPONSE_ADDRESS]));
+ 	if (!sta_addr)
+ 		return 0;
+@@ -179,7 +189,7 @@
+ 	if (!si)
+ 		return 0;
+ 
+-	si->bss_transition_response.status_code = blobmsg_get_u8(tb[BSS_TM_RESPONSE_STATUS_CODE]);
++	si->bss_transition_response.status_code = status_code;
+ 	si->bss_transition_response.timestamp = current_time;
+ 
+ 	if (si->bss_transition_response.status_code && si->kick_time && si->sta->aggressiveness) {
