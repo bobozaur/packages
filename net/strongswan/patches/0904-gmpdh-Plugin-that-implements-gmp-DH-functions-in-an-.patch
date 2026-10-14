@@ -9,6 +9,9 @@ Subject: [PATCH 904/904] gmpdh: Plugin that implements gmp DH functions in an
 Refresh the build-system context for strongSwan 6.1; register gmpdh with
 the same supported program set as the upstream gmp plugin.
 
+Upstream-Status: Inappropriate [OpenWrt plugin packaging]
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/configure.ac
 +++ b/configure.ac
 @@ -139,6 +139,7 @@

@@ -1,5 +1,9 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] Retire migrated IKEv1 owners during the delayed delete grace period
 
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/src/libcharon/processing/jobs/adopt_children_job.c
 +++ b/src/libcharon/processing/jobs/adopt_children_job.c
 @@ -176,6 +176,9 @@

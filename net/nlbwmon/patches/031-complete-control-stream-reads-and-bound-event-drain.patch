@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] Complete control frames without monopolizing the native event loop
 
 Assemble stream replies across short reads and interruptions. A partial EOF
@@ -9,6 +10,9 @@ existing inactivity timeout, closing only after output drains or fails.
 Bound one level-triggered conntrack event turn to 32 datagrams so continuous
 events cannot indefinitely exclude queued shutdown signals and control I/O.
 
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/client.c
 +++ b/client.c
 @@ -211,17 +211,40 @@
