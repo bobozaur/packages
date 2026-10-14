@@ -1117,11 +1117,14 @@ trap_handler() {
 	# $2	optional (exit status)
 	local __PIDS __PID
 	local __ERR=${2:-0}
+	local __SIGNAL=$1
 	local __OLD_IFS=$IFS
 	local __NEWLINE_IFS='
 ' # __NEWLINE_IFS
 
-	[ $PID_SLEEP -ne 0 ] && kill -$1 $PID_SLEEP 2>/dev/null	# kill pending sleep if exist
+	# A reload must finish old work before reusing the section's files.
+	[ "$1" -eq 1 ] && __SIGNAL=15
+	[ $PID_SLEEP -ne 0 ] && kill -$__SIGNAL $PID_SLEEP 2>/dev/null
 
 	case $1 in
 		 0)	if [ $__ERR -eq 0 ]; then
@@ -1129,10 +1132,7 @@ trap_handler() {
 			else
 				write_log 4 "PID '$$' exit WITH ERROR '$__ERR' at $(date_prog)${N}"
 			fi ;;
-		 1)	write_log 6 "PID '$$' received 'SIGHUP' at $(date_prog)"
-			# reload config via starting the script again
-			/usr/lib/ddns/dynamic_dns_updater.sh -v "0" -S "$__SECTIONID" -- start || true
-			exit 0 ;;	# and leave this one
+		 1)	write_log 6 "PID '$$' received 'SIGHUP' at $(date_prog)";;
 		 2)	write_log 5 "PID '$$' terminated by 'SIGINT' at $(date_prog)${N}";;
 		 3)	write_log 5 "PID '$$' terminated by 'SIGQUIT' at $(date_prog)${N}";;
 		15)	write_log 5 "PID '$$' terminated by 'SIGTERM' at $(date_prog)${N}";;
@@ -1142,17 +1142,32 @@ trap_handler() {
 	__PIDS=$(pgrep -P $$)	# get my childs (pgrep prints with "newline")
 	IFS=$__NEWLINE_IFS
 	for __PID in $__PIDS; do
-		kill -$1 $__PID	# terminate it
+		kill -$__SIGNAL "$__PID" 2>/dev/null
 	done
+	if [ "$1" -eq 1 ]; then
+		for __PID in $__PIDS; do
+			wait "$__PID" 2>/dev/null
+		done
+	fi
 	IFS=$__OLD_IFS
 
 	# remove out and err file
 	[ -f $DATFILE ] && rm -f $DATFILE
 	[ -f $ERRFILE ] && rm -f $ERRFILE
+	if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE")" = "$$" ]; then
+		rm -f "$PIDFILE"
+	fi
 
 	# exit with correct handling:
 	# remove trap handling settings and send kill to myself
 	trap - 0 1 2 3 15
+	if [ "$1" -eq 1 ]; then
+		if [ "$DRY_RUN" -ge 1 ]; then
+			exec "$0" -v "$VERBOSE" -S "$SECTION_ID" -d
+		else
+			exec "$0" -v "$VERBOSE" -S "$SECTION_ID"
+		fi
+	fi
 	[ $1 -gt 0 ] && kill -$1 $$
 }
 

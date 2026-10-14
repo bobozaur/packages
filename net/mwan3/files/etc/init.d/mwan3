@@ -7,10 +7,6 @@ START=19
 USE_PROCD=1
 SCRIPTNAME="mwan3-init"
 
-service_running() {
-	[ -d "$MWAN3_STATUS_DIR" ]
-}
-
 start_tracker() {
 	local enabled interface
 	interface=$1
@@ -25,12 +21,31 @@ start_tracker() {
 }
 
 start_service() {
+	# Package upgrades call start even for disabled init scripts. Preserve the
+	# administrator's disabled service policy; an explicit start still works.
+	if [ "$PKG_UPGRADE" = 1 ] && ! "$initscript" enabled; then
+		skip_upgrade_start=1
+		return 0
+	fi
 	local enabled hotplug_pids
 
+	procd_lock
+	[ ! -e "$MWAN3_STATUS_DIR/retired" ] || stop_service || return 1
 	mwan3_init
-	config_foreach start_tracker interface
-
 	mwan3_update_iface_to_table
+	mwan3_check_routing_ownership || return 1
+	# The reserved firewall namespace is claimed once. A directory created by
+	# status or hotplug is not evidence that this service owns any resources.
+	if [ ! -e "$MWAN3_STATUS_DIR/owned" ]; then
+		if $IPS -n list | grep -q '^mwan3_' ||
+		   $IPT4 -S | grep -q '^-N mwan3_' ||
+		   { [ "$NO_IPV6" = 0 ] && $IPT6 -S | grep -q '^-N mwan3_'; }; then
+			LOG err "The mwan3 firewall namespace is already in use"
+			return 1
+		fi
+		cat /proc/sys/kernel/random/uuid > "$MWAN3_STATUS_DIR/owned" || return 1
+	fi
+	config_foreach start_tracker interface
 	mwan3_set_dynamic_ipset
 	mwan3_set_connected_ipset
 	mwan3_set_custom_ipset
@@ -55,8 +70,14 @@ start_service() {
 }
 
 stop_service() {
-	local ipset rule IP IPTR IPT family table tid
+	local ipset ipsets rule IP IPTR IPT family table tid failed=0
 
+	[ -e "$MWAN3_STATUS_DIR/owned" ] || [ -e "$MWAN3_STATUS_DIR/retired" ] || return 0
+	# rtmon and hotplug hold this same procd lock while publishing updates.
+	# Retire their incarnation before withdrawal; queued old writers then exit.
+	if [ -e "$MWAN3_STATUS_DIR/owned" ]; then
+		mv "$MWAN3_STATUS_DIR/owned" "$MWAN3_STATUS_DIR/retired" || return 1
+	fi
 	mwan3_init
 	config_foreach mwan3_interface_shutdown interface
 
@@ -72,32 +93,32 @@ stop_service() {
 			IP="$IP6"
 		fi
 
-		for tid in $($IP route list table all | sed -ne 's/.*table \([0-9]\+\).*/\1/p' | sort -u); do
-			[ $tid -gt $MWAN3_INTERFACE_MAX ] && continue
-			$IP route flush table $tid &> /dev/null
-		done
+		$IP route flush table all proto "$MWAN3_ROUTE_PROTOCOL" || failed=1
+		$IP rule flush protocol "$MWAN3_ROUTE_PROTOCOL" || failed=1
 
-		for rule in $($IP rule list | grep -E '^[1-3][0-9]{3}:' | cut -d ':' -f 1); do
-			$IP rule del pref $rule &> /dev/null
-		done
-		table="$($IPT -S)"
+		table="$($IPT -S)" || { failed=1; continue; }
 		{
 			echo "*mangle";
 			[ -z "${table##*PREROUTING -j mwan3_hook*}" ] && echo "-D PREROUTING -j mwan3_hook"
 			[ -z "${table##*OUTPUT -j mwan3_hook*}" ] && echo "-D OUTPUT -j mwan3_hook"
-			echo "$table" | awk '{print "-F "$2}' | grep mwan3 | sort -u
-			echo "$table" | awk '{print "-X "$2}' | grep mwan3 | sort -u
+			echo "$table" | awk '$1 == "-N" && $2 ~ /^mwan3_/ {print "-F "$2}' | sort -u
+			echo "$table" | awk '$1 == "-N" && $2 ~ /^mwan3_/ {print "-X "$2}' | sort -u
 			echo "COMMIT"
-		} | $IPTR
+		} | $IPTR || failed=1
 	done
 
 	# Needed for the firewall backend to release the ipsets reference
 	sleep 2
-	for ipset in $($IPS -n list | grep mwan3_); do
-		$IPS -q destroy $ipset
+	ipsets=$($IPS -n list) || failed=1
+	for ipset in $(printf '%s\n' "$ipsets" | grep '^mwan3_'); do
+		$IPS -q destroy $ipset || failed=1
 	done
 
-	rm -rf $MWAN3_STATUS_DIR $MWAN3TRACK_STATUS_DIR
+	[ "$failed" = 0 ] || {
+		LOG err "Withdrawal failed; retaining retired owner for the next stop"
+		return 1
+	}
+	rm -rf "$MWAN3_STATUS_DIR" "$MWAN3TRACK_STATUS_DIR"
 
 }
 
@@ -107,5 +128,6 @@ reload_service() {
 }
 
 service_triggers() {
+	[ "$skip_upgrade_start" = 1 ] && return 0
 	procd_add_reload_trigger 'mwan3'
 }

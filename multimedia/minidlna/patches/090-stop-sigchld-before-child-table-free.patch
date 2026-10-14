@@ -1,0 +1,24 @@
+Subject: [PATCH] stop the child-exit handler before releasing its process table
+
+Shutdown kills the scanner and HTTP children, then frees the children table
+while SIGCHLD still invokes process_handle_child_termination(). A late
+child exit can therefore make remove_process_info() read freed memory.
+
+Ignore SIGCHLD before terminating the remaining children and releasing the
+table. Do this after monitor_stop(), which uses SIGCHLD to wake its inotify
+thread and joins that thread. The handler can then no longer run while the
+table is freed, and exiting children are reaped automatically.
+
+--- a/minidlna.c
++++ b/minidlna.c
+@@ -1360,6 +1360,10 @@ shutdown:
+ #endif
+ 
+ 	/* kill other child processes */
++	/* The monitor uses SIGCHLD to wake its thread. After it has joined,
++	 * prevent late child exits from accessing the freed process table.
++	 */
++	signal(SIGCHLD, SIG_IGN);
+ 	process_reap_children();
+ 	free(children);
+ 

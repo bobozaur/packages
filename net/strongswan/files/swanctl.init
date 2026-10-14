@@ -298,6 +298,7 @@ config_child() {
 	local interface
 	local hw_offload
 	local priority
+	local reqid
 	local rekey_bytes
 	local life_bytes
 	local rekey_packets
@@ -319,6 +320,7 @@ config_child() {
 	config_get interface "$conf" interface ""
 	config_get hw_offload "$conf" hw_offload ""
 	config_get priority "$conf" priority ""
+	config_get reqid "$conf" reqid ""
 	config_get rekey_bytes "$conf" rekey_bytes ""
 	config_get life_bytes "$conf" life_bytes ""
 	config_get rekey_packets "$conf" rekey_packets ""
@@ -387,6 +389,7 @@ config_child() {
 	[ $ipcomp -eq 1 ] && swanctl_xappend4 "ipcomp = 1"
 	[ -n "$interface" ] && swanctl_xappend4 "interface = $interface"
 	[ -n "$priority" ] && swanctl_xappend4 "priority = $priority"
+	[ -n "$reqid" ] && swanctl_xappend4 "reqid = $reqid"
 	[ -n "$if_id" ] && swanctl_xappend4 "if_id_in = $if_id" "if_id_out = $if_id"
 	[ -n "$start_action" -a "$start_action" != "none" ] && swanctl_xappend4 "start_action = $start_action"
 	[ -n "$close_action" -a "$close_action" != "none" ] && swanctl_xappend4 "close_action = $close_action"
@@ -1014,7 +1017,7 @@ service_triggers() {
 		return
 	}
 
-	procd_add_reload_trigger "ipsec"
+	procd_add_config_trigger "config.change" "ipsec" /sbin/service swanctl reload
 	config load "ipsec"
 
 	config_foreach service_trigger_ipsec globals
@@ -1073,6 +1076,7 @@ legacy_config_child() {
 	local interface
 	local ipcomp
 	local priority
+	local reqid
 	local local_subnet
 	local local_nat
 	local updown
@@ -1103,6 +1107,7 @@ legacy_config_child() {
 	config_get interface "$conf" interface ""
 	config_get hw_offload "$conf" hw_offload ""
 	config_get priority "$conf" priority ""
+	config_get reqid "$conf" reqid ""
 	config_get rekeybytes "$conf" rekeybytes ""
 	config_get lifebytes "$conf" lifebytes ""
 	config_get rekeypackets "$conf" rekeypackets ""
@@ -1186,6 +1191,7 @@ legacy_config_child() {
 	[ $ipcomp -eq 1 ] && swanctl_xappend4 "ipcomp = 1"
 	[ -n "$interface" ] && swanctl_xappend4 "interface = $interface"
 	[ -n "$priority" ] && swanctl_xappend4 "priority = $priority"
+	[ -n "$reqid" ] && swanctl_xappend4 "reqid = $reqid"
 	[ -n "$if_id" ] && swanctl_xappend4 "if_id_in = $if_id" "if_id_out = $if_id"
 	[ -n "$startaction" -a "$startaction" != "none" ] && swanctl_xappend4 "start_action = $startaction"
 	[ -n "$closeaction" -a "$closeaction" != "none" ] && swanctl_xappend4 "close_action = $closeaction"
@@ -1536,7 +1542,7 @@ legacy_prepare_env() {
 }
 
 legacy_service_triggers() {
-	procd_add_reload_trigger "ipsec"
+	procd_add_config_trigger "config.change" "ipsec" /sbin/service swanctl reload
 	config load "ipsec"
 
 	config_foreach legacy_service_trigger_ipsec ipsec

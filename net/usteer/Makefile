@@ -5,7 +5,7 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=usteer
 PKG_SOURCE_DATE:=2026-05-19
 PKG_SOURCE_VERSION:=7532e1252fb937fe34b6da05e86fd34babd91ef5
-PKG_RELEASE:=1
+PKG_RELEASE:=5
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=https://git.openwrt.org/project/usteer.git

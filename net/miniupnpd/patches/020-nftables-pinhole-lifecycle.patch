@@ -1,0 +1,983 @@
+Subject: [PATCH] nftables: keep IPv6 pinhole identity, counters and expiry coherent
+
+Query fresh kernel state, return missing IDs explicitly, acknowledge mutation
+failures, and replace renewals atomically by handle. Retain each lease-file UID
+and allocate unused IDs from surviving rules. Emit counters and protocol/family
+matches for IPv6 pinholes, including extension headers.
+
+--- a/netfilter_nft/nftnlrdr_misc.c
++++ b/netfilter_nft/nftnlrdr_misc.c
+@@ -243,7 +243,6 @@
+ static void
+ parse_rule_counter(struct nftnl_expr *e, rule_t *r)
+ {
+-	r->type = RULE_COUNTER;
+ 	r->bytes = nftnl_expr_get_u64(e, NFTNL_EXPR_CTR_BYTES);
+ 	r->packets = nftnl_expr_get_u64(e, NFTNL_EXPR_CTR_PACKETS);
+ }
+@@ -257,6 +256,12 @@
+ 
+ 	/* ToDo: body of both cases are identical - bug? */
+ 	switch (key) {
++	case NFT_META_L4PROTO:
++		set_reg(r, dreg, RULE_REG_IP6_PROTO, 0);
++		break;
++	case NFT_META_NFPROTO:
++		set_reg(r, dreg, RULE_REG_NONE, 0);
++		break;
+ 	case NFT_META_IIF:
+ 		reg_type = RULE_REG_IIF;
+ 		set_reg(r, dreg, reg_type, 0);
+@@ -636,6 +641,13 @@
+ #undef CB_DATA
+ 
+ int
++refresh_nft_cache_filter_fresh(void)
++{
++	rule_list_filter_validate = RULE_CACHE_INVALID;
++	return refresh_nft_cache_filter();
++}
++
++int
+ refresh_nft_cache_filter(void)
+ {
+ 	if (rule_list_filter_validate != RULE_CACHE_VALID) {
+@@ -1076,12 +1088,14 @@
+  * rport is the (optional) source port of the rule
+  */
+ struct nftnl_rule *
+-rule_set_filter6(uint8_t family, const char * ifname, uint8_t proto,
++rule_set_filter6(uint8_t family, uint32_t ifindex, uint8_t proto,
+ 		struct in6_addr *rhost6, struct in6_addr *iaddr6,
+ 		unsigned short eport, unsigned short iport,
+-		unsigned short rport, const char *descr, const char *handle)
++		unsigned short rport, const char *descr, const rule_t *previous)
+ {
+ 	struct nftnl_rule *r = NULL;
++	struct nftnl_expr *counter;
++	uint8_t nfproto = NFPROTO_IPV6;
+ 
+ 	r = nftnl_rule_alloc();
+ 	if (r == NULL) {
+@@ -1089,7 +1103,19 @@
+ 		return NULL;
+ 	}
+ 
+-	r = rule_set_filter_common(r, family, ifname, proto, eport, iport, rport, descr, handle);
++	r = rule_set_filter_common(r, family, NULL, proto, eport, iport, rport, descr, NULL);
++	if (previous)
++		nftnl_rule_set_u64(r, NFTNL_RULE_HANDLE, previous->handle);
++#ifdef USE_IFNAME_IN_RULES
++	if (ifindex) {
++		expr_add_meta(r, NFT_META_IIF, NFT_REG_1);
++		expr_add_cmp(r, NFT_REG_1, NFT_CMP_EQ, &ifindex, sizeof(ifindex));
++	}
++#else
++	UNUSED(ifindex);
++#endif
++	expr_add_meta(r, NFT_META_NFPROTO, NFT_REG_1);
++	expr_add_cmp(r, NFT_REG_1, NFT_CMP_EQ, &nfproto, sizeof(nfproto));
+ 
+ 	/* Destination IP */
+ 	expr_add_payload(r, NFT_PAYLOAD_NETWORK_HEADER, NFT_REG_1,
+@@ -1104,10 +1130,17 @@
+ 	}
+ 
+ 	/* Protocol */
+-	expr_add_payload(r, NFT_PAYLOAD_NETWORK_HEADER, NFT_REG_1,
+-	                 offsetof(struct ipv6hdr, nexthdr), sizeof(uint8_t));
++	expr_add_meta(r, NFT_META_L4PROTO, NFT_REG_1);
+ 	expr_add_cmp(r, NFT_REG_1, NFT_CMP_EQ, &proto, sizeof(uint8_t));
+ 
++	counter = nftnl_expr_alloc("counter");
++	if (!counter) {
++		nftnl_rule_free(r);
++		return NULL;
++	}
++	nftnl_expr_set_u64(counter, NFTNL_EXPR_CTR_PACKETS, previous ? previous->packets : 0);
++	nftnl_expr_set_u64(counter, NFTNL_EXPR_CTR_BYTES, previous ? previous->bytes : 0);
++	nftnl_rule_add_expr(r, counter);
+ 	expr_set_reg_verdict(r, NF_ACCEPT);
+ 
+ 	debug_rule(r);
+@@ -1223,14 +1256,16 @@
+ 	nfg->res_id = NFNL_SUBSYS_NFTABLES;
+ }
+ 
+-int
+-nft_send_rule(struct nftnl_rule * rule, uint16_t cmd, enum rule_chain_type chain_type)
++static int
++nft_send_rule_flags(struct nftnl_rule * rule, uint16_t cmd, enum rule_chain_type chain_type, uint16_t flags)
+ {
+ 	int result = -1;
+ 	struct nlmsghdr *nlh;
+ 	struct mnl_nlmsg_batch *batch;
+ 	char buf[MNL_SOCKET_BUFFER_SIZE*2];
+ 
++	if (!rule)
++		return -1;
+ 	batch = start_batch(buf, MNL_SOCKET_BUFFER_SIZE);
+ 	if (batch != NULL)
+ 	{
+@@ -1248,7 +1283,7 @@
+ 		nlh = nftnl_rule_nlmsg_build_hdr(mnl_nlmsg_batch_current(batch),
+ 		                                 cmd,
+ 		                                 nftnl_rule_get_u32(rule, NFTNL_RULE_FAMILY),
+-		                                 NLM_F_APPEND|NLM_F_CREATE|NLM_F_ACK,
++		                                 flags|NLM_F_ACK,
+ 		                                 mnl_seq++);
+ 
+ 		nftnl_rule_nlmsg_build_payload(nlh, rule);
+@@ -1259,9 +1294,23 @@
+ 			syslog(LOG_ERR, "%s(%p, %d, %d) send_batch failed %d",
+ 			       "nft_send_rule", rule, (int)cmd, (int)chain_type, result);
+ 		}
++	} else {
++		nftnl_rule_free(rule);
+ 	}
+ 
+ 	return result;
++}
++
++int
++nft_send_rule(struct nftnl_rule *rule, uint16_t cmd, enum rule_chain_type type)
++{
++	return nft_send_rule_flags(rule, cmd, type, NLM_F_APPEND | NLM_F_CREATE);
++}
++
++int
++nft_replace_rule(struct nftnl_rule *rule, enum rule_chain_type type)
++{
++	return nft_send_rule_flags(rule, NFT_MSG_NEWRULE, type, NLM_F_REPLACE);
+ }
+ 
+ int
+--- a/netfilter_nft/nftpinhole.c
++++ b/netfilter_nft/nftpinhole.c
+@@ -68,6 +68,32 @@
+ /*
+ ip saddr <rem_host> ip daddr <int_client> tcp sport <rem_port>  tcp dport <int_port>
+ */
++/* Reconstruct allocation from the kernel, including surviving rules after a
++ * daemon restart. The bounded bitmap also prevents collisions after UID wrap. */
++static int allocate_uid(void)
++{
++	unsigned char used[8192] = {0};
++	rule_t *p;
++	int uid;
++	unsigned int timestamp;
++	if (refresh_nft_cache_filter_fresh() < 0)
++		return -1;
++	LIST_FOREACH(p, &head_filter, entry) {
++		if (p->type == RULE_FILTER && p->desc_len &&
++		    sscanf(p->desc, PINEHOLE_LABEL_FORMAT_SKIPDESC, &uid, &timestamp) == 2 &&
++		    uid > 0 && uid < 65535)
++			used[uid / 8] |= 1U << (uid % 8);
++	}
++	uid = next_uid;
++	do {
++		if (!(used[uid / 8] & (1U << (uid % 8))))
++			return uid;
++		if (++uid >= 65535)
++			uid = 1;
++	} while (uid != next_uid);
++	return -1;
++}
++
+ int add_pinhole(const char * ifname,
+                 const char * rem_host, unsigned short rem_port,
+                 const char * int_client, unsigned short int_port,
+@@ -80,24 +106,31 @@
+ 	struct in6_addr rhost_addr, ihost_addr;
+ 	struct in6_addr *rhost_addr_p;
+ 
+-	uid = next_uid;
++	uint32_t ifindex = ifname ? if_nametoindex(ifname) : 0;
++	if (ifname && !ifindex)
++		return -1;
++	uid = allocate_uid();
++	if (uid < 0)
++		return -1;
+ 
+ 	d_printf(("add_pinhole(%s, %s, %hu, %s, %hu, %d, %s, %u)\n",
+ 	          ifname, rem_host, rem_port, int_client, int_port, proto, desc, timestamp));
+ 
+ 	if (rem_host && rem_host[0] != '\0' && rem_host[0] != '*') {
+-		inet_pton(AF_INET6, rem_host, &rhost_addr);
++		if (inet_pton(AF_INET6, rem_host, &rhost_addr) != 1)
++			return -1;
+ 		rhost_addr_p = &rhost_addr;
+ 	} else {
+ 		rhost_addr_p = NULL;
+ 	}
+ 
+-	inet_pton(AF_INET6, int_client, &ihost_addr);
++	if (inet_pton(AF_INET6, int_client, &ihost_addr) != 1)
++		return -1;
+ 
+ 	snprintf(comment, NFT_DESCR_SIZE,
+ 		         PINEHOLE_LABEL_FORMAT, uid, timestamp, desc);
+ 
+-	r = rule_set_filter6(nft_ipv6_family, ifname, proto,
++	r = rule_set_filter6(nft_ipv6_family, ifindex, proto,
+ 			    rhost_addr_p, &ihost_addr,
+ 				0, int_port, rem_port, comment, 0);
+ 
+@@ -106,7 +139,8 @@
+ 	if (res < 0)
+ 		return -1;
+ 
+-	if (++next_uid >= 65535) {
++	next_uid = uid + 1;
++	if (next_uid >= 65535) {
+ 		next_uid = 1;
+ 	}
+ 
+@@ -130,7 +164,7 @@
+ 	if (rem_host && rem_host[0] != '\0' && rem_host[0] != '*') {
+ 		if (inet_pton(AF_INET6, rem_host, &saddr) < 1) {
+ 			syslog(LOG_WARNING, "Failed to parse INET6 address \"%s\"", rem_host);
+-			memset(&saddr, 0, sizeof(struct in6_addr));
++			return -1;
+ 		}
+ 	} else {
+ 		memset(&saddr, 0, sizeof(struct in6_addr));
+@@ -138,11 +172,12 @@
+ 
+ 	if (inet_pton(AF_INET6, int_client, &daddr) < 1) {
+ 		syslog(LOG_WARNING, "Failed to parse INET6 address \"%s\"", int_client);
+-		memset(&daddr, 0, sizeof(struct in6_addr));
++		return -1;
+ 	}
+ 
+ 	d_printf(("find_pinhole()\n"));
+-	refresh_nft_cache_filter();
++	if (refresh_nft_cache_filter_fresh() < 0)
++		return -1;
+ 
+ 	LIST_FOREACH(p, &head_filter, entry) {
+ 
+@@ -194,7 +229,8 @@
+ 	         "pinhole-%hu", uid);
+ 
+ 	d_printf(("delete_pinhole()\n"));
+-	refresh_nft_cache_filter();
++	if (refresh_nft_cache_filter_fresh() < 0)
++		return -1;
+ 
+ 	LIST_FOREACH(p, &head_filter, entry) {
+ 		// Only forward entries
+@@ -210,8 +246,7 @@
+ 		/* compare the uid value */
+ 		if (0 == strcmp(tmp_label, label_start)) {
+ 			r = rule_del_handle(p);
+-			nft_send_rule(r, NFT_MSG_DELRULE, RULE_CHAIN_FILTER);
+-			return 0;
++			return nft_send_rule(r, NFT_MSG_DELRULE, RULE_CHAIN_FILTER) < 0 ? -1 : 0;
+ 		}
+ 	}
+ 
+@@ -221,115 +256,35 @@
+ int
+ update_pinhole(unsigned short uid, unsigned int timestamp)
+ {
+-#ifdef DEBUG
+-	char iaddr[INET6_ADDRSTRLEN];
+-#endif
+-	char raddr[INET6_ADDRSTRLEN];
+-	char label_start[NFT_DESCR_SIZE];
+-	char tmp_label[NFT_DESCR_SIZE];
+-	char desc[NFT_DESCR_SIZE];
+-	char ifname[IFNAMSIZ];
++	rule_t *p;
++	const char *desc;
++	struct nftnl_rule *r;
+ 	char comment[NFT_DESCR_SIZE];
+-	char * tmp_p;
+-	uint32_t ext_if_indx;
+-	int proto, res;
+-	unsigned short iport, rport;
+-	rule_t *p;
+-	struct in6_addr rhost_addr, ihost_addr;
+-	struct in6_addr * rhost_addr_p;
+-	struct nftnl_rule *r;
+-
+-	d_printf(("update_pinhole()\n"));
+-
+-	snprintf(label_start, sizeof(label_start),
+-	         "pinhole-%hu", uid);
+-
+-	refresh_nft_cache_filter();
+-
+-	proto = -1;
+-	memset(&rhost_addr, 0, sizeof(struct in6_addr));
+-
+-	LIST_FOREACH(p, &head_filter, entry) {
+-		// Only forward entries
+-		if (p->type != RULE_FILTER)
+-			continue;
+-
+-		if (p->desc_len == 0)
+-			continue;
+-
+-		strncpy(tmp_label, p->desc, sizeof(tmp_label));
+-		tmp_label[sizeof(tmp_label) - 1] = '\0';
+-		strtok(tmp_label, " ");
+-		/* check for the right uid */
+-		if (0 == strcmp(tmp_label, label_start)) {
+-			char *pd;
+-			/* Source IP Address */
+-			// Check if empty
+-			if (0 == memcmp(&rhost_addr, &p->saddr6, sizeof(struct in6_addr))) {
+-				rhost_addr_p = NULL;
+-				raddr[0] = '*';
+-				raddr[1] = '\0';
+-			} else {
+-				rhost_addr_p = &p->saddr6;
+-				if (inet_ntop(AF_INET6, rhost_addr_p, raddr, INET6_ADDRSTRLEN) == NULL) {
+-					syslog(LOG_WARNING, "%s: inet_ntop(raddr): %m", "update_pinhole");
+-				}
+-			}
+-
+-			/* Source Port */
+-			rport = p->sport;
+-
+-			/* Destination IP Address */
+-			ihost_addr = p->daddr6;
+-
+-			/* Destination Port */
+-			iport = p->dport;
+-
+-			proto = p->proto;
+-
+-			ext_if_indx = p->ingress_ifidx;
+-			if_indextoname(ext_if_indx, ifname);
+-
+-			pd = strchr(p->desc, ':');
+-			if (pd) {
+-				pd += 2;
+-				strncpy(desc, pd, sizeof(desc));
+-				desc[sizeof(desc) - 1] = '\0';
+-			} else {
+-				desc[0] = '\0';
+-			}
+-
+-			break;
+-		}
+-	}
+-
+-	if (proto == -1)
+-		return -2;
+-
+-	// Delete rule
+-	r = rule_del_handle(p);
+-	res = nft_send_rule(r, NFT_MSG_DELRULE, RULE_CHAIN_FILTER);
+-
+-	if (res < 0)
+-		return -1;
+-
+-	// readd rule with new timestamp
+-	snprintf(comment, NFT_DESCR_SIZE,
+-		         PINEHOLE_LABEL_FORMAT, uid, timestamp, desc);
+-
+-	d_printf(("update add_pinhole(%s, %s, %s, %d, %d, %d, %s)\n",
+-	          ifname, raddr, inet_ntop(AF_INET6, &ihost_addr, iaddr, INET6_ADDRSTRLEN), rport, iport, proto, comment));
+-
+-	r = rule_set_filter6(nft_ipv6_family, ifname, proto,
+-			    rhost_addr_p, &ihost_addr,
+-				0, iport, rport, comment, 0);
+-
+-	res = nft_send_rule(r, NFT_MSG_NEWRULE, RULE_CHAIN_FILTER);
+-
+-	if (res < 0)
+-		return -1;
+-
+-	return 0;
++	int found_uid;
++	unsigned int old_timestamp;
++	if (refresh_nft_cache_filter_fresh() < 0)
++		return -1;
++	LIST_FOREACH(p, &head_filter, entry) {
++		if (p->type != RULE_FILTER || !p->desc_len ||
++		    sscanf(p->desc, PINEHOLE_LABEL_FORMAT_SKIPDESC, &found_uid, &old_timestamp) != 2 ||
++		    found_uid != uid)
++			continue;
++		desc = strchr(p->desc, ':');
++		if (desc) {
++			desc++;
++			if (*desc == ' ') desc++;
++		} else {
++			desc = "";
++		}
++		snprintf(comment, sizeof(comment), PINEHOLE_LABEL_FORMAT, uid, timestamp, desc);
++		/* Replacing by handle commits the new lease without first removing
++		 * the old permit. Preserve ingress identity and sampled counters. */
++		r = rule_set_filter6(nft_ipv6_family, p->ingress_ifidx,
++			p->proto, IN6_IS_ADDR_UNSPECIFIED(&p->saddr6) ? NULL : &p->saddr6,
++			&p->daddr6, 0, p->dport, p->sport, comment, p);
++		return nft_replace_rule(r, RULE_CHAIN_FILTER) < 0 ? -1 : 0;
++	}
++	return -2;
+ }
+ 
+ int
+@@ -351,7 +306,8 @@
+ 	         "pinhole-%hu", uid);
+ 
+ 	d_printf(("get_pinhole_info()\n"));
+-	refresh_nft_cache_filter();
++	if (refresh_nft_cache_filter_fresh() < 0)
++		return -1;
+ 
+ 	LIST_FOREACH(p, &head_filter, entry) {
+ 		// Only forward entries
+@@ -420,13 +376,13 @@
+ 					*bytes = p->bytes;
+ 			}
+ 
+-			break;
++			return 0;
+ 		}
+ 	}
+ 
+ 	d_printf(("end_pinhole_info()\n"));
+ 
+-	return 0;
++	return -2;
+ }
+ 
+ int get_pinhole_uid_by_index(int index)
+@@ -444,13 +400,17 @@
+ 	unsigned int ts;
+ 	int uid;
+ 	unsigned int min_ts = UINT_MAX;
+-	int min_uid = INT_MAX, max_uid = -1;
++	int failed = 0;
+ 	int n = 0;
+ 
+ 	current_time = upnp_time();
+ 
+ 	d_printf(("clean_pinhole_list()\n"));
+-	refresh_nft_cache_filter();
++	if (refresh_nft_cache_filter() < 0) {
++		if (next_timestamp)
++			*next_timestamp = (unsigned int)current_time + 1;
++		return -1;
++	}
+ 
+ 	LIST_FOREACH(p, &head_filter, entry) {
+ 		// Only forward entries
+@@ -468,13 +428,14 @@
+ 		if (ts <= (unsigned int)current_time) {
+ 			syslog(LOG_INFO, "removing expired pinhole '%s'", p->desc);
+ 			r = rule_del_handle(p);
+-			nft_send_rule(r, NFT_MSG_DELRULE, RULE_CHAIN_FILTER);
+-			n++;
++			if (nft_send_rule(r, NFT_MSG_DELRULE, RULE_CHAIN_FILTER) < 0) {
++				failed = 1;
++				if ((unsigned int)current_time + 1 < min_ts)
++					min_ts = (unsigned int)current_time + 1;
++			} else {
++				n++;
++			}
+ 		} else {
+-			if (uid > max_uid)
+-				max_uid = uid;
+-			else if (uid < min_uid)
+-				min_uid = uid;
+ 			if (ts < min_ts)
+ 				min_ts = ts;
+ 		}
+@@ -483,17 +444,7 @@
+ 	if (next_timestamp && (min_ts != UINT_MAX))
+ 		*next_timestamp = min_ts;
+ 
+-	if (max_uid > 0) {
+-		if (((min_uid - 32000) <= next_uid) && (next_uid <= max_uid)) {
+-			next_uid = max_uid + 1;
+-		}
+-
+-		if (next_uid >= 65535) {
+-			next_uid = 1;
+-		}
+-	}
+-
+-	return n;	/* number of rules removed */
++	return failed ? -1 : n;	/* preserve failed leases for a bounded retry */
+ }
+ 
+ #endif /* ENABLE_UPNPPINHOLE */
+--- a/upnppinhole.c
++++ b/upnppinhole.c
+@@ -16,6 +16,7 @@
+ #include <arpa/inet.h>
+ 
+ #include <stdio.h>
++#include <errno.h>
+ #include <ctype.h>
+ #include <unistd.h>
+ 
+@@ -93,250 +94,104 @@
+ #endif
+ 
+ #ifdef ENABLE_LEASEFILE
++/* Replace, renew or remove exactly one UID through one atomic file rewrite.
++ * A replacement record is authoritative; timestamp-only renewal retains the
++ * other fields and every unrelated row verbatim. */
+ static int
+-lease_file6_add(const char * rem_client,
+-			   unsigned short rem_port,
+-               const char * int_client,
+-               unsigned short int_port,
+-               int proto,
+-			   int uid,
+-               const char * desc,
+-               unsigned int leaseduration)
+-{
+-	unsigned int timestamp;
+-	FILE * fd;
+-
+-	if (lease_file6 == NULL) return 0;
+-
+-	fd = fopen( lease_file6, "a");
+-	if (fd==NULL) {
+-		syslog(LOG_ERR, "could not open lease file: %s", lease_file);
+-		return -1;
+-	}
+-
+-	timestamp = (leaseduration > 0) ? time(NULL) + leaseduration : 0;
+-
+-	/* convert our time to unix time */
+-	if (timestamp != 0) {
+-		timestamp -= upnp_time();
+-	}
+-	if (rem_client == NULL) {
+-		rem_client = "";
+-	}
+-	if (desc == NULL) {
+-		desc = "";
+-	}
+-
+-	fprintf(fd, "%s;%s;%hu;%s;%hu;%u;%u;%s\n",
+-	        proto_itoa(proto), int_client, int_port, rem_client, rem_port,
+-	        uid, timestamp, desc);
+-	fclose(fd);
+-
+-	return 0;
++lease_file6_rewrite(int uid, const char *record, unsigned int timestamp)
++{
++	FILE *fd, *fdt;
++	int tmp, failed = 0, found = 0;
++	char line[512], tmpfilename[128];
++	if (!lease_file6)
++		return 0;
++	if (uid < 0 || strlen(lease_file6) + 7 > sizeof(tmpfilename))
++		return -1;
++	fd = fopen(lease_file6, "r");
++	if (!fd && errno != ENOENT)
++		return -1;
++	if (!fd && !record)
++		return 0;
++	snprintf(tmpfilename, sizeof(tmpfilename), "%sXXXXXX", lease_file6);
++	tmp = mkstemp(tmpfilename);
++	if (tmp < 0) {
++		if (fd) fclose(fd);
++		return -1;
++	}
++	fchmod(tmp, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
++	fdt = fdopen(tmp, "w");
++	if (!fdt) {
++		close(tmp);
++		if (fd) fclose(fd);
++		remove(tmpfilename);
++		return -1;
++	}
++	while (fd && fgets(line, sizeof(line), fd)) {
++		char *field = line, *end;
++		unsigned long row_uid;
++		int i;
++		for (i = 0; i < 5 && field; i++) {
++			field = strchr(field, ';');
++			if (field) field++;
++		}
++		if (field) {
++			row_uid = strtoul(field, &end, 10);
++			if (end != field && *end == ';' && row_uid == (unsigned int)uid) {
++				if (record) {
++					if (!found && fputs(record, fdt) == EOF) failed = 1;
++				} else if (timestamp) {
++					char *suffix = strchr(++end, ';');
++					size_t prefix = end - line;
++					if (!suffix || fwrite(line, 1, prefix, fdt) != prefix ||
++					    fprintf(fdt, "%u%s", timestamp, suffix) < 0) failed = 1;
++				}
++				found = 1;
++				if (failed) break;
++				continue;
++			}
++		}
++		if (fputs(line, fdt) == EOF) {
++			failed = 1;
++			break;
++		}
++	}
++	if (record && !found && fputs(record, fdt) == EOF) failed = 1;
++	if (fd) {
++		failed |= ferror(fd);
++		if (fclose(fd)) failed = 1;
++	}
++	if (fclose(fdt)) failed = 1;
++	if (!failed && rename(tmpfilename, lease_file6) == 0)
++		return 0;
++	remove(tmpfilename);
++	return -1;
+ }
+ 
+ static int
+-lease_file6_update(int uid, unsigned int leaseduration)
+-{
+-	FILE* fd, *fdt;
+-	char * p, * p2;
+-	unsigned short int_port, rem_port;
+-	char * proto;
+-	char * int_client;
+-	char * desc;
+-	char * rem_client;
+-	unsigned int timestamp_rule;
+-	unsigned int timestamp;
+-	char line[128];
+-	char tmpfilename[128];
+-	int uid_rule;
+-	int tmp;
+-
+-	if (lease_file6 == NULL) return 0;
+-
+-	if (strlen(lease_file6) + 7 > sizeof(tmpfilename)) {
+-		syslog(LOG_ERR, "Lease filename is too long");
+-		return -1;
+-	}
+-
+-	snprintf( tmpfilename, sizeof(tmpfilename), "%sXXXXXX", lease_file6);
+-
+-	fd = fopen( lease_file6, "r");
+-	if (fd==NULL) {
+-		return 0;
+-	}
+-
+-	tmp = mkstemp(tmpfilename);
+-	if (tmp==-1) {
+-		fclose(fd);
+-		syslog(LOG_ERR, "could not open temporary lease file");
+-		return -1;
+-	}
+-
+-	fchmod(tmp, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+-	fdt = fdopen(tmp, "a");
+-
+-	timestamp = (leaseduration > 0) ? time(NULL) + leaseduration : 0;
+-
+-	/* convert our time to unix time */
+-	if (timestamp != 0) {
+-		timestamp -= upnp_time();
+-	}
+-
+-	while(fgets(line, sizeof(line), fd)) {
+-
+-		syslog(LOG_DEBUG, "parsing lease file line '%s'", line);
+-		proto = line;
+-		p = strchr(line, ';');
+-		if(!p) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(p++) = '\0';
+-		p2 = strchr(p, ';');
+-		if(!p2) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(p2++) = '\0';
+-		int_port = (unsigned short)atoi(p2);
+-		int_client = p;
+-		p = strchr(p2, ';');
+-		if(!p) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(p++) = '\0';
+-		p2 = strchr(p, ';');
+-		if(!p2) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(p2++) = '\0';
+-		rem_port = (unsigned short)atoi(p2);
+-		rem_client = p;
+-		p = strchr(p2, ';');
+-		if(!p) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(p++) = '\0';
+-		p2 = strchr(p, ';');
+-		if(!p2) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(p2++) = '\0';
+-		desc = strchr(p2, ';');
+-		uid_rule = atoi(p);
+-		if(!desc) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(desc++) = '\0';
+-		timestamp_rule = (unsigned int)strtoul(p2, NULL, 10);
+-
+-		if (uid == uid_rule) {
+-			timestamp_rule = timestamp;
+-		}
+-
+-		fprintf(fdt, "%s;%s;%hu;%s;%hu;%u;%u;%s\n",
+-	        proto, int_client, int_port, rem_client, rem_port,
+-	        uid, timestamp_rule, desc);
+-	}
+-
+-	fclose(fdt);
+-	fclose(fd);
+-
+-	if (rename(tmpfilename, lease_file6) < 0) {
+-		syslog(LOG_ERR, "could not rename temporary lease file to %s", lease_file6);
+-		remove(tmpfilename);
+-	}
+-
+-	return 0;
++lease_file6_add(const char *rem_client, unsigned short rem_port,
++	const char *int_client, unsigned short int_port, int proto, int uid,
++	const char *desc, unsigned int expiry)
++{
++	char record[512];
++	unsigned int timestamp = expiry ? time(NULL) + expiry - upnp_time() : 0;
++	int len = snprintf(record, sizeof(record), "%s;%s;%hu;%s;%hu;%u;%u;%s\n",
++		proto_itoa(proto), int_client, int_port, rem_client ? rem_client : "",
++		rem_port, uid, timestamp, desc ? desc : "");
++	if (len < 0 || (unsigned int)len >= sizeof(record))
++		return -1;
++	return lease_file6_rewrite(uid, record, 0);
+ }
+ 
+ static int
+-lease_file6_remove(const char * int_client, unsigned short int_port, int proto, int uid)
+-{
+-	FILE* fd, *fdt;
+-	int tmp, uid_tmp;
+-	char buf[512], buf2[512];
+-	char str[32];
+-	char tmpfilename[128];
+-	char *p, *p2;
+-	int str_size, buf_size;
+-
+-
+-	if (lease_file6 == NULL) return 0;
+-
+-	if (strlen(lease_file6) + 7 > sizeof(tmpfilename)) {
+-		syslog(LOG_ERR, "Lease filename is too long");
+-		return -1;
+-	}
+-
+-	snprintf( tmpfilename, sizeof(tmpfilename), "%sXXXXXX", lease_file6);
+-
+-	fd = fopen( lease_file6, "r");
+-	if (fd==NULL) {
+-		return 0;
+-	}
+-
+-	snprintf( str, sizeof(str), "%s;%s;%u", proto_itoa(proto), int_client, int_port);
+-	str_size = strlen(str);
+-
+-	tmp = mkstemp(tmpfilename);
+-	if (tmp==-1) {
+-		fclose(fd);
+-		syslog(LOG_ERR, "could not open temporary lease file");
+-		return -1;
+-	}
+-	fchmod(tmp, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+-	fdt = fdopen(tmp, "a");
+-
+-	buf[sizeof(buf)-1] = 0;
+-	while( fgets(buf, sizeof(buf)-1, fd) != NULL) {
+-		buf_size = strlen(buf);
+-
+-		if (uid > 0) {
+-			strncpy(buf2, buf, buf_size);
+-			// Internal Host
+-			p = strchr(buf2, ';');
+-			*(p++) = '\0';
+-			// Internal Port
+-			p = strchr(p, ';');
+-			*(p++) = '\0';
+-			// External Host
+-			p = strchr(p, ';');
+-			*(p++) = '\0';
+-			// External Port
+-			p = strchr(p, ';');
+-			*(p++) = '\0';
+-			// uid
+-			p = strchr(p, ';');
+-			*(p++) = '\0';
+-			p2 = strchr(p, ';');
+-			*(p2++) = '\0';
+-			uid_tmp = atoi(p);
+-			if (uid != uid_tmp) {
+-				fwrite(buf, buf_size, 1, fdt);
+-			}
+-
+-		} else if (buf_size < str_size || strncmp(str, buf, str_size)!=0) {
+-			fwrite(buf, buf_size, 1, fdt);
+-		}
+-	}
+-
+-	fclose(fdt);
+-	fclose(fd);
+-
+-	if (rename(tmpfilename, lease_file6) < 0) {
+-		syslog(LOG_ERR, "could not rename temporary lease file to %s", lease_file6);
+-		remove(tmpfilename);
+-	}
+-
+-	return 0;
+-
++lease_file6_update(int uid, unsigned int expiry)
++{
++	return lease_file6_rewrite(uid, NULL, time(NULL) + expiry - upnp_time());
++}
++
++static int
++lease_file6_remove(int uid)
++{
++	return lease_file6_rewrite(uid, NULL, 0);
+ }
+ 
+ int lease_file6_expire(void)
+@@ -630,19 +485,22 @@
+ 		r = upnp_update_inboundpinhole(*uid, leasetime);
+ #ifdef ENABLE_LEASEFILE
+ 		if (r >= 0) {
+-			lease_file6_remove(iaddr, iport, proto, -1);
+-			lease_file6_add(raddr, rport, iaddr, iport, proto, *uid, desc, timestamp);
++			if (lease_file6_add(raddr, rport, iaddr, iport, proto, *uid, desc, timestamp) < 0)
++				return -1;
+ 		}
+ #endif /* ENABLE_LEASEFILE */
+ 		return (r >= 0) ? 1 : r;
+ 	}
+ #if defined(USE_PF) || defined(USE_NETFILTER)
++	if (*uid != -2)
++		return *uid;
++
+ 	*uid = add_pinhole (ext_if_name6, raddr, rport,
+ 	                    iaddr, iport, proto, desc, timestamp);
+ #ifdef ENABLE_LEASEFILE
+ 	if (*uid >= 0) {
+-		lease_file6_remove(iaddr, iport, proto, -1);
+-		lease_file6_add(raddr, rport, iaddr, iport, proto, *uid, desc, timestamp);
++		if (lease_file6_add(raddr, rport, iaddr, iport, proto, *uid, desc, timestamp) < 0)
++			return -1;
+ 	}
+ #endif /* ENABLE_LEASEFILE */
+ 	return *uid >= 0 ? 1 : -1;
+@@ -795,8 +653,8 @@
+ 	timestamp = upnp_time() + leasetime;
+ 	ret = update_pinhole(uid, timestamp);
+ #ifdef ENABLE_LEASEFILE
+-	if (ret == 0)
+-		lease_file6_update(uid, timestamp);
++	if (ret == 0 && lease_file6_update(uid, timestamp) < 0)
++		return -1;
+ #endif
+ 	return ret;
+ #else
+@@ -810,14 +668,12 @@
+ upnp_delete_inboundpinhole(unsigned short uid)
+ {
+ #if defined(USE_PF) || defined(USE_NETFILTER)
+-	int ret;
+-	ret = delete_pinhole(uid);
+ #ifdef ENABLE_LEASEFILE
+-	if (ret == 0)
+-		lease_file6_remove((const char *)"*", 0, 0, uid);
+-#endif
+-
+-	return ret;
++	/* Do not leave a reloadable permit after withdrawing its live rule. */
++	if (lease_file6_remove(uid) < 0)
++		return -1;
++#endif
++	return delete_pinhole(uid);
+ #else
+ 	UNUSED(uid);
+ 
+@@ -1054,7 +910,8 @@
+ 	UNUSED(next_timestamp);
+ #endif
+ #ifdef ENABLE_LEASEFILE
+-	lease_file6_expire();
++	if (ret >= 0)
++		lease_file6_expire();
+ #endif
+ 
+ 	return ret;
+--- a/upnpsoap.c
++++ b/upnpsoap.c
+@@ -1945,7 +1945,7 @@
+ 	       action, ltime, uid);
+ 
+ 	n = upnp_update_inboundpinhole(uid, ltime);
+-	if(n == -1)
++	if(n == -2)
+ 		SoapError(h, 704, "NoSuchEntry");
+ 	else if(n < 0)
+ 		SoapError(h, 501, "Action Failed");
+@@ -2204,12 +2204,11 @@
+ 		if(PinholeVerification(h, iaddr, iport)<=0)
+ 			return ;
+ 	}
+-#if 0
+-	else if(r == -4 || r == -1)
+-	{
+-		SoapError(h, 704, "NoSuchEntry");
+-	}
+-#endif
++	else {
++		SoapError(h, n == -2 ? 704 : 501, n == -2 ? "NoSuchEntry" : "Action Failed");
++		return;
++	}
++
+ 
+ 	bodylen = snprintf(body, sizeof(body), resp,
+ 			action, ns/*"urn:schemas-upnp-org:service:WANIPv6FirewallControl:1"*/,
+--- a/netfilter_nft/nftnlrdr_misc.h
++++ b/netfilter_nft/nftnlrdr_misc.h
+@@ -110,6 +110,9 @@
+ #define debug_rule(rule)
+ #endif
+ 
++int refresh_nft_cache_filter_fresh(void);
++int nft_replace_rule(struct nftnl_rule *rule, enum rule_chain_type type);
++
+ int
+ nft_send_rule(struct nftnl_rule * rule, uint16_t cmd, enum rule_chain_type type);
+ struct nftnl_rule *
+@@ -131,10 +134,10 @@
+ 		unsigned short eport, unsigned short iport,
+ 		unsigned short rport, const char * descr, const char *handle);
+ struct nftnl_rule *
+-rule_set_filter6(uint8_t family, const char * ifname, uint8_t proto,
++rule_set_filter6(uint8_t family, uint32_t ifindex, uint8_t proto,
+ 		struct in6_addr *rhost6, struct in6_addr *iaddr6,
+ 		unsigned short eport, unsigned short iport, 
+-		unsigned short rport, const char *descr, const char *handle);
++		unsigned short rport, const char *descr, const rule_t *previous);
+ struct nftnl_rule *
+ rule_set_filter_common(struct nftnl_rule *r, uint8_t family, const char * ifname,
+ 		uint8_t proto, unsigned short eport, unsigned short iport, 

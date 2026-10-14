@@ -1,0 +1,137 @@
+Subject: [PATCH] usteer: apply configured aggressiveness to existing stations
+
+Native station discovery can precede the init script's set_config call.
+Refresh the cached effective policy after a complete configuration update
+so existing clients do not keep the initial aggressive default. Preserve
+omitted callback settings on update_config and honor current MAC overrides
+without copying untrusted strings into a fixed buffer. Retire usteer's
+pending kicks when the new policy is advisory or disabled.
+
+Expose effective station aggressiveness in the existing management replies;
+a global get_config value alone does not describe the policy in use.
+
+---
+
+--- a/sta.c
++++ b/sta.c
+@@ -81,23 +81,42 @@
+ {
+ 	struct blob_attr *cur;
+ 	int rem;
+ 	char sta_mac[18];
+-	char config_entry[20];
+-	char config_mac[18];
++	const char *entry;
+ 	
+ 	sprintf(sta_mac, MAC_ADDR_FMT, MAC_ADDR_DATA(sta->addr));
+ 	sta->aggressiveness = config.aggressiveness;
+ 	blobmsg_for_each_attr(cur, config.aggressiveness_mac_list, rem) {
+-		strcpy(config_entry, blobmsg_get_string(cur));
+-		if (strlen(config_entry) != 19)
+-			continue;
+-		strncpy(config_mac, config_entry, 18);
+-		config_mac[17] = '\0';
+-		if (strcmp(config_mac, sta_mac) != 0)
+-			continue;
+-		sta->aggressiveness = config_entry[18] - '0';
++		if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING ||
++		    blobmsg_data_len(cur) != 20)
++			continue;
++		entry = blobmsg_get_string(cur);
++		if (entry[19] || entry[17] != ',' ||
++		    entry[18] < '0' || entry[18] > '4' ||
++		    strncmp(entry, sta_mac, 17))
++			continue;
++		sta->aggressiveness = entry[18] - '0';
+ 		break;
++	}
++}
++
++void
++usteer_sta_update_config(void)
++{
++	struct sta *sta;
++	struct sta_info *si;
++
++	avl_for_each_element(&stations, sta, avl) {
++		usteer_sta_update_aggressiveness(sta);
++		if (sta->aggressiveness >= 2)
++			continue;
++		/* An advisory/disabled policy must not retain our pending kick.
++		 * An imminent-disassociation timer already sent to hostapd has
++		 * its own lifetime and is not revoked by this local update.
++		 */
++		list_for_each_entry(si, &sta->nodes, list)
++			si->kick_time = 0;
+ 	}
+ }
+ 
+ struct sta_info *
+--- a/usteer.h
++++ b/usteer.h
+@@ -368,8 +368,9 @@
+                                        uint8_t validity_period,
+                                        struct usteer_node *target_node);
+ 
+ struct sta *usteer_sta_get(const uint8_t *addr, bool create);
++void usteer_sta_update_config(void);
+ struct sta_info *usteer_sta_info_get(struct sta *sta, struct usteer_node *node, bool *create);
+ 
+ bool usteer_sta_supports_beacon_measurement_mode(struct sta_info *si, enum usteer_beacon_measurement_mode mode);
+ bool usteer_sta_supports_link_measurement(struct sta_info *si);
+--- a/ubus.c
++++ b/ubus.c
+@@ -105,8 +105,9 @@
+ 
+ 	blob_buf_init(&b, 0);
+ 	blobmsg_add_u8(&b, "2ghz", sta->seen_2ghz);
+ 	blobmsg_add_u8(&b, "5ghz", sta->seen_5ghz);
++	blobmsg_add_u32(&b, "aggressiveness", sta->aggressiveness);
+ 	_n = blobmsg_open_table(&b, "nodes");
+ 	list_for_each_entry(si, &sta->nodes, list) {
+ 		_cur_n = blobmsg_open_table(&b, usteer_node_name(si->node));
+ 		blobmsg_add_u8(&b, "connected", si->connected);
+@@ -257,11 +258,12 @@
+ 		      struct ubus_request_data *req, const char *method,
+ 		      struct blob_attr *msg)
+ {
+ 	struct blob_attr *tb[__CFG_MAX];
++	bool reset = !strcmp(method, "set_config");
+ 	int i;
+ 
+-	if (!strcmp(method, "set_config"))
++	if (reset)
+ 		usteer_init_defaults();
+ 
+ 	blobmsg_parse(config_policy, __CFG_MAX, tb, blob_data(msg), blob_len(msg));
+ 	for (i = 0; i < __CFG_MAX; i++) {
+@@ -280,13 +282,19 @@
+ 			*config_data[i].ptr.U32 = blobmsg_get_u32(tb[i]);
+ 			break;
+ 		case CFG_ARRAY_CB:
+ 		case CFG_STRING_CB:
++			if (!tb[i] && !reset)
++				continue;
+ 			config_data[i].ptr.CB.set(tb[i]);
+ 			break;
+ 		}
+ 	}
+ 
++	/* Initial discovery may precede the init script's set_config call.
++	 * Apply the new policy to existing stations as well as future ones.
++	 */
++	usteer_sta_update_config();
+ 	usteer_interface_init();
+ 
+ 	return 0;
+ }
+@@ -420,8 +428,9 @@
+ 			s = blobmsg_open_table_mac(&b, si->sta->addr);
+ 			blobmsg_add_u32(&b, "signal", si->signal);
+ 			blobmsg_add_u64(&b, "created", current_time - si->created);
+ 			blobmsg_add_u64(&b, "connected", current_time - si->connected_since);
++			blobmsg_add_u32(&b, "aggressiveness", si->sta->aggressiveness);
+ 
+ 			t = blobmsg_open_table(&b, "snr-kick");
+ 			blobmsg_add_u32(&b, "seen-below", si->below_min_snr);
+ 			blobmsg_close_table(&b, t);

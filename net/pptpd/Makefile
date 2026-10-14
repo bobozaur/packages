@@ -9,7 +9,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=pptpd
 PKG_VERSION:=1.5.0
-PKG_RELEASE:=4
+PKG_RELEASE:=7
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=@SF/poptop
@@ -27,7 +27,7 @@ include $(INCLUDE_DIR)/package.mk
 define Package/pptpd
   SECTION:=net
   CATEGORY:=Network
-  DEPENDS:=+kmod-ppp +kmod-gre +kmod-mppe +ppp
+  DEPENDS:=+kmod-ppp +kmod-gre +kmod-mppe +ppp +ucode +ucode-mod-fs +ucode-mod-uci
   TITLE:=PopTop pptp server
   URL:=https://poptop.sourceforge.net/
   SUBMENU:=VPN
@@ -62,6 +62,8 @@ define Package/pptpd/install
 	$(INSTALL_DATA) ./files/pptpd.conf $(1)/etc/
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/pptpd.init $(1)/etc/init.d/pptpd
+	$(INSTALL_DIR) $(1)/usr/share/pptpd
+	$(INSTALL_DATA) ./files/credentials.uc $(1)/usr/share/pptpd/
 	$(INSTALL_DIR) $(1)/etc/ppp
 	$(INSTALL_DATA) ./files/options.pptpd $(1)/etc/ppp/
 	$(INSTALL_DIR) $(1)/etc/config
