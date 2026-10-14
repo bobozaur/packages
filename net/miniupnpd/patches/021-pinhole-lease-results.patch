@@ -1,0 +1,459 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] preserve pinhole lease identities and action results
+
+Renew only the selected lease UID without relabeling unrelated entries.
+Keep backend failure distinct from an absent pinhole in SOAP replies, and
+report lease publication separately from live-kernel mutation.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/upnppinhole.c
++++ b/upnppinhole.c
+@@ -16,6 +16,7 @@
+ #include <arpa/inet.h>
+ 
+ #include <stdio.h>
++#include <errno.h>
+ #include <ctype.h>
+ #include <unistd.h>
+ 
+@@ -93,250 +94,104 @@
+ #endif
+ 
+ #ifdef ENABLE_LEASEFILE
++/* Replace, renew or remove exactly one UID through one atomic file rewrite.
++ * A replacement record is authoritative; timestamp-only renewal retains the
++ * other fields and every unrelated row verbatim. */
+ static int
+-lease_file6_add(const char * rem_client,
+-			   unsigned short rem_port,
+-               const char * int_client,
+-               unsigned short int_port,
+-               int proto,
+-			   int uid,
+-               const char * desc,
+-               unsigned int leaseduration)
+-{
+-	unsigned int timestamp;
+-	FILE * fd;
+-
+-	if (lease_file6 == NULL) return 0;
+-
+-	fd = fopen( lease_file6, "a");
+-	if (fd==NULL) {
+-		syslog(LOG_ERR, "could not open lease file: %s", lease_file);
+-		return -1;
+-	}
+-
+-	timestamp = (leaseduration > 0) ? time(NULL) + leaseduration : 0;
+-
+-	/* convert our time to unix time */
+-	if (timestamp != 0) {
+-		timestamp -= upnp_time();
+-	}
+-	if (rem_client == NULL) {
+-		rem_client = "";
+-	}
+-	if (desc == NULL) {
+-		desc = "";
+-	}
+-
+-	fprintf(fd, "%s;%s;%hu;%s;%hu;%u;%u;%s\n",
+-	        proto_itoa(proto), int_client, int_port, rem_client, rem_port,
+-	        uid, timestamp, desc);
+-	fclose(fd);
+-
+-	return 0;
++lease_file6_rewrite(int uid, const char *record, unsigned int timestamp)
++{
++	FILE *fd, *fdt;
++	int tmp, failed = 0, found = 0;
++	char line[512], tmpfilename[128];
++	if (!lease_file6)
++		return 0;
++	if (uid < 0 || strlen(lease_file6) + 7 > sizeof(tmpfilename))
++		return -1;
++	fd = fopen(lease_file6, "r");
++	if (!fd && errno != ENOENT)
++		return -1;
++	if (!fd && !record)
++		return 0;
++	snprintf(tmpfilename, sizeof(tmpfilename), "%sXXXXXX", lease_file6);
++	tmp = mkstemp(tmpfilename);
++	if (tmp < 0) {
++		if (fd) fclose(fd);
++		return -1;
++	}
++	fchmod(tmp, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
++	fdt = fdopen(tmp, "w");
++	if (!fdt) {
++		close(tmp);
++		if (fd) fclose(fd);
++		remove(tmpfilename);
++		return -1;
++	}
++	while (fd && fgets(line, sizeof(line), fd)) {
++		char *field = line, *end;
++		unsigned long row_uid;
++		int i;
++		for (i = 0; i < 5 && field; i++) {
++			field = strchr(field, ';');
++			if (field) field++;
++		}
++		if (field) {
++			row_uid = strtoul(field, &end, 10);
++			if (end != field && *end == ';' && row_uid == (unsigned int)uid) {
++				if (record) {
++					if (!found && fputs(record, fdt) == EOF) failed = 1;
++				} else if (timestamp) {
++					char *suffix = strchr(++end, ';');
++					size_t prefix = end - line;
++					if (!suffix || fwrite(line, 1, prefix, fdt) != prefix ||
++					    fprintf(fdt, "%u%s", timestamp, suffix) < 0) failed = 1;
++				}
++				found = 1;
++				if (failed) break;
++				continue;
++			}
++		}
++		if (fputs(line, fdt) == EOF) {
++			failed = 1;
++			break;
++		}
++	}
++	if (record && !found && fputs(record, fdt) == EOF) failed = 1;
++	if (fd) {
++		failed |= ferror(fd);
++		if (fclose(fd)) failed = 1;
++	}
++	if (fclose(fdt)) failed = 1;
++	if (!failed && rename(tmpfilename, lease_file6) == 0)
++		return 0;
++	remove(tmpfilename);
++	return -1;
+ }
+ 
+ static int
+-lease_file6_update(int uid, unsigned int leaseduration)
+-{
+-	FILE* fd, *fdt;
+-	char * p, * p2;
+-	unsigned short int_port, rem_port;
+-	char * proto;
+-	char * int_client;
+-	char * desc;
+-	char * rem_client;
+-	unsigned int timestamp_rule;
+-	unsigned int timestamp;
+-	char line[128];
+-	char tmpfilename[128];
+-	int uid_rule;
+-	int tmp;
+-
+-	if (lease_file6 == NULL) return 0;
+-
+-	if (strlen(lease_file6) + 7 > sizeof(tmpfilename)) {
+-		syslog(LOG_ERR, "Lease filename is too long");
+-		return -1;
+-	}
+-
+-	snprintf( tmpfilename, sizeof(tmpfilename), "%sXXXXXX", lease_file6);
+-
+-	fd = fopen( lease_file6, "r");
+-	if (fd==NULL) {
+-		return 0;
+-	}
+-
+-	tmp = mkstemp(tmpfilename);
+-	if (tmp==-1) {
+-		fclose(fd);
+-		syslog(LOG_ERR, "could not open temporary lease file");
+-		return -1;
+-	}
+-
+-	fchmod(tmp, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+-	fdt = fdopen(tmp, "a");
+-
+-	timestamp = (leaseduration > 0) ? time(NULL) + leaseduration : 0;
+-
+-	/* convert our time to unix time */
+-	if (timestamp != 0) {
+-		timestamp -= upnp_time();
+-	}
+-
+-	while(fgets(line, sizeof(line), fd)) {
+-
+-		syslog(LOG_DEBUG, "parsing lease file line '%s'", line);
+-		proto = line;
+-		p = strchr(line, ';');
+-		if(!p) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(p++) = '\0';
+-		p2 = strchr(p, ';');
+-		if(!p2) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(p2++) = '\0';
+-		int_port = (unsigned short)atoi(p2);
+-		int_client = p;
+-		p = strchr(p2, ';');
+-		if(!p) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(p++) = '\0';
+-		p2 = strchr(p, ';');
+-		if(!p2) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(p2++) = '\0';
+-		rem_port = (unsigned short)atoi(p2);
+-		rem_client = p;
+-		p = strchr(p2, ';');
+-		if(!p) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(p++) = '\0';
+-		p2 = strchr(p, ';');
+-		if(!p2) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(p2++) = '\0';
+-		desc = strchr(p2, ';');
+-		uid_rule = atoi(p);
+-		if(!desc) {
+-			syslog(LOG_ERR, "unrecognized data in lease file");
+-			continue;
+-		}
+-		*(desc++) = '\0';
+-		timestamp_rule = (unsigned int)strtoul(p2, NULL, 10);
+-
+-		if (uid == uid_rule) {
+-			timestamp_rule = timestamp;
+-		}
+-
+-		fprintf(fdt, "%s;%s;%hu;%s;%hu;%u;%u;%s\n",
+-	        proto, int_client, int_port, rem_client, rem_port,
+-	        uid, timestamp_rule, desc);
+-	}
+-
+-	fclose(fdt);
+-	fclose(fd);
+-
+-	if (rename(tmpfilename, lease_file6) < 0) {
+-		syslog(LOG_ERR, "could not rename temporary lease file to %s", lease_file6);
+-		remove(tmpfilename);
+-	}
+-
+-	return 0;
++lease_file6_add(const char *rem_client, unsigned short rem_port,
++	const char *int_client, unsigned short int_port, int proto, int uid,
++	const char *desc, unsigned int expiry)
++{
++	char record[512];
++	unsigned int timestamp = expiry ? time(NULL) + expiry - upnp_time() : 0;
++	int len = snprintf(record, sizeof(record), "%s;%s;%hu;%s;%hu;%u;%u;%s\n",
++		proto_itoa(proto), int_client, int_port, rem_client ? rem_client : "",
++		rem_port, uid, timestamp, desc ? desc : "");
++	if (len < 0 || (unsigned int)len >= sizeof(record))
++		return -1;
++	return lease_file6_rewrite(uid, record, 0);
+ }
+ 
+ static int
+-lease_file6_remove(const char * int_client, unsigned short int_port, int proto, int uid)
+-{
+-	FILE* fd, *fdt;
+-	int tmp, uid_tmp;
+-	char buf[512], buf2[512];
+-	char str[32];
+-	char tmpfilename[128];
+-	char *p, *p2;
+-	int str_size, buf_size;
+-
+-
+-	if (lease_file6 == NULL) return 0;
+-
+-	if (strlen(lease_file6) + 7 > sizeof(tmpfilename)) {
+-		syslog(LOG_ERR, "Lease filename is too long");
+-		return -1;
+-	}
+-
+-	snprintf( tmpfilename, sizeof(tmpfilename), "%sXXXXXX", lease_file6);
+-
+-	fd = fopen( lease_file6, "r");
+-	if (fd==NULL) {
+-		return 0;
+-	}
+-
+-	snprintf( str, sizeof(str), "%s;%s;%u", proto_itoa(proto), int_client, int_port);
+-	str_size = strlen(str);
+-
+-	tmp = mkstemp(tmpfilename);
+-	if (tmp==-1) {
+-		fclose(fd);
+-		syslog(LOG_ERR, "could not open temporary lease file");
+-		return -1;
+-	}
+-	fchmod(tmp, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+-	fdt = fdopen(tmp, "a");
+-
+-	buf[sizeof(buf)-1] = 0;
+-	while( fgets(buf, sizeof(buf)-1, fd) != NULL) {
+-		buf_size = strlen(buf);
+-
+-		if (uid > 0) {
+-			strncpy(buf2, buf, buf_size);
+-			// Internal Host
+-			p = strchr(buf2, ';');
+-			*(p++) = '\0';
+-			// Internal Port
+-			p = strchr(p, ';');
+-			*(p++) = '\0';
+-			// External Host
+-			p = strchr(p, ';');
+-			*(p++) = '\0';
+-			// External Port
+-			p = strchr(p, ';');
+-			*(p++) = '\0';
+-			// uid
+-			p = strchr(p, ';');
+-			*(p++) = '\0';
+-			p2 = strchr(p, ';');
+-			*(p2++) = '\0';
+-			uid_tmp = atoi(p);
+-			if (uid != uid_tmp) {
+-				fwrite(buf, buf_size, 1, fdt);
+-			}
+-
+-		} else if (buf_size < str_size || strncmp(str, buf, str_size)!=0) {
+-			fwrite(buf, buf_size, 1, fdt);
+-		}
+-	}
+-
+-	fclose(fdt);
+-	fclose(fd);
+-
+-	if (rename(tmpfilename, lease_file6) < 0) {
+-		syslog(LOG_ERR, "could not rename temporary lease file to %s", lease_file6);
+-		remove(tmpfilename);
+-	}
+-
+-	return 0;
+-
++lease_file6_update(int uid, unsigned int expiry)
++{
++	return lease_file6_rewrite(uid, NULL, time(NULL) + expiry - upnp_time());
++}
++
++static int
++lease_file6_remove(int uid)
++{
++	return lease_file6_rewrite(uid, NULL, 0);
+ }
+ 
+ int lease_file6_expire(void)
+@@ -630,19 +485,22 @@
+ 		r = upnp_update_inboundpinhole(*uid, leasetime);
+ #ifdef ENABLE_LEASEFILE
+ 		if (r >= 0) {
+-			lease_file6_remove(iaddr, iport, proto, -1);
+-			lease_file6_add(raddr, rport, iaddr, iport, proto, *uid, desc, timestamp);
++			if (lease_file6_add(raddr, rport, iaddr, iport, proto, *uid, desc, timestamp) < 0)
++				return -1;
+ 		}
+ #endif /* ENABLE_LEASEFILE */
+ 		return (r >= 0) ? 1 : r;
+ 	}
+ #if defined(USE_PF) || defined(USE_NETFILTER)
++	if (*uid != -2)
++		return *uid;
++
+ 	*uid = add_pinhole (ext_if_name6, raddr, rport,
+ 	                    iaddr, iport, proto, desc, timestamp);
+ #ifdef ENABLE_LEASEFILE
+ 	if (*uid >= 0) {
+-		lease_file6_remove(iaddr, iport, proto, -1);
+-		lease_file6_add(raddr, rport, iaddr, iport, proto, *uid, desc, timestamp);
++		if (lease_file6_add(raddr, rport, iaddr, iport, proto, *uid, desc, timestamp) < 0)
++			return -1;
+ 	}
+ #endif /* ENABLE_LEASEFILE */
+ 	return *uid >= 0 ? 1 : -1;
+@@ -795,8 +653,8 @@
+ 	timestamp = upnp_time() + leasetime;
+ 	ret = update_pinhole(uid, timestamp);
+ #ifdef ENABLE_LEASEFILE
+-	if (ret == 0)
+-		lease_file6_update(uid, timestamp);
++	if (ret == 0 && lease_file6_update(uid, timestamp) < 0)
++		return -1;
+ #endif
+ 	return ret;
+ #else
+@@ -810,14 +668,12 @@
+ upnp_delete_inboundpinhole(unsigned short uid)
+ {
+ #if defined(USE_PF) || defined(USE_NETFILTER)
+-	int ret;
+-	ret = delete_pinhole(uid);
+ #ifdef ENABLE_LEASEFILE
+-	if (ret == 0)
+-		lease_file6_remove((const char *)"*", 0, 0, uid);
+-#endif
+-
+-	return ret;
++	/* Do not leave a reloadable permit after withdrawing its live rule. */
++	if (lease_file6_remove(uid) < 0)
++		return -1;
++#endif
++	return delete_pinhole(uid);
+ #else
+ 	UNUSED(uid);
+ 
+@@ -1054,7 +910,8 @@
+ 	UNUSED(next_timestamp);
+ #endif
+ #ifdef ENABLE_LEASEFILE
+-	lease_file6_expire();
++	if (ret >= 0)
++		lease_file6_expire();
+ #endif
+ 
+ 	return ret;
+--- a/upnpsoap.c
++++ b/upnpsoap.c
+@@ -1945,7 +1945,7 @@
+ 	       action, ltime, uid);
+ 
+ 	n = upnp_update_inboundpinhole(uid, ltime);
+-	if(n == -1)
++	if(n == -2)
+ 		SoapError(h, 704, "NoSuchEntry");
+ 	else if(n < 0)
+ 		SoapError(h, 501, "Action Failed");
+@@ -2204,12 +2204,11 @@
+ 		if(PinholeVerification(h, iaddr, iport)<=0)
+ 			return ;
+ 	}
+-#if 0
+-	else if(r == -4 || r == -1)
+-	{
+-		SoapError(h, 704, "NoSuchEntry");
+-	}
+-#endif
++	else {
++		SoapError(h, n == -2 ? 704 : 501, n == -2 ? "NoSuchEntry" : "Action Failed");
++		return;
++	}
++
+ 
+ 	bodylen = snprintf(body, sizeof(body), resp,
+ 			action, ns/*"urn:schemas-upnp-org:service:WANIPv6FirewallControl:1"*/,

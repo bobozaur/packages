@@ -1,8 +1,8 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] pptpd: keep control and PPP process lifetimes owned
 
-Reject an excess call on a one-channel control connection without
-replacing its active call. Track every controller, including delegate
-mode, and retire controllers and the broadcast relay before exit. Keep
+Track every controller, including delegate mode, and retire controllers
+and the broadcast relay before exit. Keep
 PPP in its original child process and reap it before releasing control.
 
 Adopt descendants on forced controller exit and retain an inherited
@@ -11,38 +11,9 @@ accept clients while the old native owners remain, even if procd's
 shutdown deadline forces the manager to exit. Lock acquisition failure
 is reported before creating a relay or listener.
 
---- a/ctrlpacket.c
-+++ b/ctrlpacket.c
-@@ -420,17 +420,15 @@
-         out_call_rqst = (struct pptp_out_call_rqst *) packet;
- 
-         if ((pac_call_id = getcall()) == htons(-1)) {
--                /* XXX should reject call */
--                syslog(LOG_ERR, "CTRL: No free Call IDs!");
--                pac_call_id = 0;
-+                syslog(LOG_WARNING, "CTRL: Rejecting additional call on an occupied control connection");
-         }
-         MAKE_CTRL_HEADER(out_call_rply, OUT_CALL_RPLY);
-         /* call_id is used for ctrl, call_id_peer is used for GRE
-          * call_id_peer is what we were sent by the other end in ctrl initilization
-          */
--        out_call_rply.call_id = pac_call_id;
-+        out_call_rply.call_id = (pac_call_id == htons(-1)) ? 0 : pac_call_id;
-         out_call_rply.call_id_peer = out_call_rqst->call_id;
--        out_call_rply.result_code = CONNECTED;
-+        out_call_rply.result_code = (pac_call_id == htons(-1)) ? DO_NOT_ACCEPT : CONNECTED;
-         out_call_rply.error_code = NO_ERROR;
-         out_call_rply.cause_code = NO_ERROR;
-         /* maybe limit to pppd speed? but pppd doesn't accept 10Mbps as a speed and yet
-@@ -676,7 +674,7 @@
-                 _pac_init = 1;
-         }
-         if(_pac_call_id != htons(-1))
--                syslog(LOG_ERR, "CTRL: Asked to allocate call id when call open, not handled well");
-+                return htons(-1);
-         _pac_call_id = htons(i);
-         i++;
-         return _pac_call_id;
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/pptpctrl.c
 +++ b/pptpctrl.c
 @@ -51,6 +51,9 @@
