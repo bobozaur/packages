@@ -1,8 +1,17 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] nftables: serialize port allocations with fw4 reservations
 
+Coordinate OpenWrt timed port triggers and native UPnP/NAT-PMP/PCP mappings
+through the existing fw4 lock and one bounded reservation snapshot. Treat
+a missing reservation set as ordinary firewall4 compatibility; reject an
+incomplete or malformed set rather than allocate a conflicting mapping.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/commonrdr.h
 +++ b/commonrdr.h
-@@ -12,6 +12,22 @@
+@@ -12,6 +12,26 @@
   */
  
  #include "config.h"
@@ -11,6 +20,10 @@ Subject: [PATCH] nftables: serialize port allocations with fw4 reservations
 + * through mapping publication. Begin/end may nest within one daemon request.
 + * Only startup lease restoration may wait; event-loop requests fail if busy.
 + * A successful begin permits O(1) reserved-port lookup until the matching end.
++ * The OpenWrt producer owns inet fw4 port_trigger_ports and /var/run/fw4.lock.
++ * Set keys concatenate ifname, inet_proto and inet_service; nftables pads each
++ * component to a 32-bit register boundary, with network-order protocol/port.
++ * An absent set is ordinary fw4 compatibility; invalid/incomplete dumps fail.
 + */
 +#ifdef USE_NFTABLES
 +int port_mapping_begin(const char *ifname, int wait);
