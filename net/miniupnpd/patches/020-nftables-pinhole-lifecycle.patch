@@ -10,7 +10,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 ---
 --- a/netfilter_nft/nftnlrdr_misc.c
 +++ b/netfilter_nft/nftnlrdr_misc.c
-@@ -243,7 +243,6 @@
+@@ -249,7 +249,6 @@
  static void
  parse_rule_counter(struct nftnl_expr *e, rule_t *r)
  {
@@ -18,7 +18,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	r->bytes = nftnl_expr_get_u64(e, NFTNL_EXPR_CTR_BYTES);
  	r->packets = nftnl_expr_get_u64(e, NFTNL_EXPR_CTR_PACKETS);
  }
-@@ -257,6 +256,12 @@
+@@ -263,6 +262,12 @@
  
  	/* ToDo: body of both cases are identical - bug? */
  	switch (key) {
@@ -31,7 +31,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	case NFT_META_IIF:
  		reg_type = RULE_REG_IIF;
  		set_reg(r, dreg, reg_type, 0);
-@@ -636,6 +641,13 @@
+@@ -642,6 +647,13 @@
  #undef CB_DATA
  
  int
@@ -45,7 +45,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  refresh_nft_cache_filter(void)
  {
  	if (rule_list_filter_validate != RULE_CACHE_VALID) {
-@@ -1076,12 +1088,14 @@
+@@ -1107,12 +1119,14 @@
   * rport is the (optional) source port of the rule
   */
  struct nftnl_rule *
@@ -62,7 +62,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  	r = nftnl_rule_alloc();
  	if (r == NULL) {
-@@ -1089,7 +1103,19 @@
+@@ -1120,7 +1134,19 @@
  		return NULL;
  	}
  
@@ -83,7 +83,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  	/* Destination IP */
  	expr_add_payload(r, NFT_PAYLOAD_NETWORK_HEADER, NFT_REG_1,
-@@ -1104,10 +1130,17 @@
+@@ -1135,10 +1161,17 @@
  	}
  
  	/* Protocol */
@@ -103,7 +103,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	expr_set_reg_verdict(r, NF_ACCEPT);
  
  	debug_rule(r);
-@@ -1223,14 +1256,16 @@
+@@ -1255,14 +1288,16 @@
  	nfg->res_id = NFNL_SUBSYS_NFTABLES;
  }
  
@@ -122,7 +122,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	batch = start_batch(buf, MNL_SOCKET_BUFFER_SIZE);
  	if (batch != NULL)
  	{
-@@ -1248,7 +1283,7 @@
+@@ -1280,7 +1315,7 @@
  		nlh = nftnl_rule_nlmsg_build_hdr(mnl_nlmsg_batch_current(batch),
  		                                 cmd,
  		                                 nftnl_rule_get_u32(rule, NFTNL_RULE_FAMILY),
@@ -131,7 +131,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		                                 mnl_seq++);
  
  		nftnl_rule_nlmsg_build_payload(nlh, rule);
-@@ -1259,9 +1294,23 @@
+@@ -1291,9 +1326,23 @@
  			syslog(LOG_ERR, "%s(%p, %d, %d) send_batch failed %d",
  			       "nft_send_rule", rule, (int)cmd, (int)chain_type, result);
  		}
@@ -280,7 +280,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		}
  	}
  
-@@ -221,115 +256,35 @@
+@@ -221,114 +256,35 @@
  int
  update_pinhole(unsigned short uid, unsigned int timestamp)
  {
@@ -296,7 +296,6 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +	const char *desc;
 +	struct nftnl_rule *r;
  	char comment[NFT_DESCR_SIZE];
--	char * tmp_p;
 -	uint32_t ext_if_indx;
 -	int proto, res;
 -	unsigned short iport, rport;
@@ -424,7 +423,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  int
-@@ -351,7 +306,8 @@
+@@ -350,7 +306,8 @@
  	         "pinhole-%hu", uid);
  
  	d_printf(("get_pinhole_info()\n"));
@@ -434,7 +433,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  	LIST_FOREACH(p, &head_filter, entry) {
  		// Only forward entries
-@@ -420,13 +376,13 @@
+@@ -419,13 +376,13 @@
  					*bytes = p->bytes;
  			}
  
@@ -450,7 +449,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  int get_pinhole_uid_by_index(int index)
-@@ -444,13 +400,17 @@
+@@ -443,13 +400,17 @@
  	unsigned int ts;
  	int uid;
  	unsigned int min_ts = UINT_MAX;
@@ -470,7 +469,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  	LIST_FOREACH(p, &head_filter, entry) {
  		// Only forward entries
-@@ -468,13 +428,14 @@
+@@ -467,13 +428,14 @@
  		if (ts <= (unsigned int)current_time) {
  			syslog(LOG_INFO, "removing expired pinhole '%s'", p->desc);
  			r = rule_del_handle(p);
@@ -491,7 +490,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  			if (ts < min_ts)
  				min_ts = ts;
  		}
-@@ -483,17 +444,7 @@
+@@ -482,17 +444,7 @@
  	if (next_timestamp && (min_ts != UINT_MAX))
  		*next_timestamp = min_ts;
  

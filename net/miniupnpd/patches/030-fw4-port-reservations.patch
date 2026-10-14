@@ -82,7 +82,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  #include <linux/netfilter.h>
  #include <linux/netfilter/nfnetlink.h>
-@@ -87,6 +91,225 @@
+@@ -93,6 +97,225 @@
  static uint32_t rule_list_redirect_validate = RULE_CACHE_INVALID;
  static uint32_t rule_list_peer_validate = RULE_CACHE_INVALID;
  
@@ -310,7 +310,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
   * return : 0 for OK, -1 for error
 --- a/pcpserver.c
 +++ b/pcpserver.c
-@@ -903,7 +903,7 @@
+@@ -910,7 +910,7 @@
  }
  #endif /* PCP_PEER */
  
@@ -319,7 +319,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
  	int r = 0;
  	char iaddr_old[INET6_ADDRSTRLEN];
-@@ -942,6 +942,13 @@
+@@ -949,6 +949,13 @@
  			if (pcp_msg_info->ext_port == 0) { /* skip port zero */
  				pcp_msg_info->ext_port++;
  			}
@@ -333,7 +333,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  			continue;
  		}
  		any_eport_allowed = 1;
-@@ -1001,6 +1008,16 @@
+@@ -1008,6 +1015,16 @@
  	if (r < 0)
  		return PCP_ERR_NO_RESOURCES;
  	return PCP_SUCCESS;
@@ -360,7 +360,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #include "upnpredirect.h"
  #include "upnpglobalvars.h"
  #include "upnpevents.h"
-@@ -147,7 +148,7 @@
+@@ -154,7 +155,7 @@
  /* reload_from_lease_file()
   * read lease_file and add the rules contained
   */
@@ -369,7 +369,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
  	FILE * fd;
  	char * p;
-@@ -258,6 +259,21 @@
+@@ -265,6 +266,21 @@
  	return 0;
  }
  
@@ -391,7 +391,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #ifdef LEASEFILE_USE_REMAINING_TIME
  void lease_file_rewrite(void)
  {
-@@ -293,8 +309,8 @@
+@@ -300,8 +316,8 @@
   *          -3 permission check failed
   *          -4 already redirected (other mechanism)
   */
@@ -402,7 +402,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
                const char * iaddr, unsigned short iport,
                const char * protocol, const char * desc,
                unsigned int leaseduration)
-@@ -399,7 +415,25 @@
+@@ -406,7 +422,25 @@
  }
  
  int
@@ -429,7 +429,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
                         const char * iaddr, unsigned short iport,
                         int proto, const char * desc,
                         unsigned int timestamp)
-@@ -435,6 +469,24 @@
+@@ -442,6 +476,24 @@
  	upnp_event_var_change_notify(EWanIPC);
  #endif
  	return 0;
@@ -464,7 +464,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #include "upnpglobalvars.h"
  #include "upnphttp.h"
  #include "upnpsoap.h"
-@@ -708,6 +709,12 @@
+@@ -768,6 +769,12 @@
  			SoapError(h, 606, "Action not authorized");
  			return;
  		}
@@ -477,7 +477,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	}
  
  	/* first try the port asked in request, then
-@@ -749,6 +756,7 @@
+@@ -809,6 +816,7 @@
  		}
  	}
  

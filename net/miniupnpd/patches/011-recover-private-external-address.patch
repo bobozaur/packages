@@ -10,7 +10,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 ---
 --- a/miniupnpd.c
 +++ b/miniupnpd.c
-@@ -1193,8 +1193,8 @@ static void update_disable_port_forwarding(void)
+@@ -1205,8 +1205,8 @@
  				syslog(LOG_INFO, "Public IP address is required by UPnP/PCP/PMP protocols and clients do not work without it");
  				disable_port_forwarding = 1;
  			}

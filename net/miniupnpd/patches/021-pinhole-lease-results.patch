@@ -430,7 +430,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	return ret;
 --- a/upnpsoap.c
 +++ b/upnpsoap.c
-@@ -1945,7 +1945,7 @@
+@@ -2112,7 +2112,7 @@
  	       action, ltime, uid);
  
  	n = upnp_update_inboundpinhole(uid, ltime);
@@ -439,9 +439,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		SoapError(h, 704, "NoSuchEntry");
  	else if(n < 0)
  		SoapError(h, 501, "Action Failed");
-@@ -2204,12 +2204,11 @@
- 		if(PinholeVerification(h, iaddr, iport)<=0)
- 			return ;
+@@ -2397,10 +2397,9 @@
  	}
 -#if 0
 -	else if(r == -4 || r == -1)
