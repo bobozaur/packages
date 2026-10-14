@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] stop the child-exit handler before releasing its process table
 
 Shutdown kills the scanner and HTTP children, then frees the children table
@@ -9,6 +10,9 @@ table. Do this after monitor_stop(), which uses SIGCHLD to wake its inotify
 thread and joins that thread. The handler can then no longer run while the
 table is freed, and exiting children are reaped automatically.
 
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/minidlna.c
 +++ b/minidlna.c
 @@ -1360,6 +1360,10 @@ shutdown:

@@ -1,3 +1,12 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] xl2tpd: reply to status-lac on the request channel
+
+Return bounded native LAC state to the requesting control FIFO, including a
+missing-name result, rather than writing an unrelated diagnostic stream.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/xl2tpd.c
 +++ b/xl2tpd.c
 @@ -74,7 +74,7 @@

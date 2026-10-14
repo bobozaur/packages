@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] usteer: use valid BTM tokens and native ubus event widths
 
 A zero BTM dialog token is discarded by stations without a response.
@@ -11,6 +12,9 @@ the existing response policy instead of dropping events on a type mismatch.
 
 ---
 
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/usteer.h
 +++ b/usteer.h
 @@ -262,6 +262,7 @@

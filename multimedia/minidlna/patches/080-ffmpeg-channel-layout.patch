@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] libav: read channel count from the new channel layout API
 
 libavcodec 59.24.100 added AVCodecParameters.ch_layout and deprecated the
@@ -8,6 +9,9 @@ older libavcodec versions.
 All FFmpeg channel-count consumers use lav_channels(), including AAC
 profile selection and the stored audio metadata.
 
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/libav.h
 +++ b/libav.h
 @@ -174,7 +174,11 @@ lav_get_interlaced(AVStream *s)

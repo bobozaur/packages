@@ -1,3 +1,12 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] fsck_hfs: copy a complete fixed-size dummy volume name
+
+Use a zero-initialized Str27 object rather than reading sizeof(Str27) bytes
+from a shorter string literal. Preserve the Pascal length byte and name.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/fsck_hfs.tproj/dfalib/SVerify1.c
 +++ b/fsck_hfs.tproj/dfalib/SVerify1.c
 @@ -3454,7 +3454,8 @@ OSErr	VLockedChk( SGlobPtr GPtr )

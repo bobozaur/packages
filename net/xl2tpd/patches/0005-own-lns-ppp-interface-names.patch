@@ -1,3 +1,13 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] xl2tpd: own LNS PPP names and validate replacement configuration
+
+Validate an optional seven-character interface prefix and append the actual
+PPP child PID. Add parser-only -t validation so the service owner can reject
+an invalid replacement before retiring live clients.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/file.h
 +++ b/file.h
 @@ -98,6 +98,7 @@

@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] usteer: use native station signal when no average is available
 
 NL80211_STA_INFO_SIGNAL_AVG is optional. Drivers which publish the measured
@@ -8,6 +9,9 @@ Initialize stations without a measurement to NO_SIGNAL, not calloc's zero,
 and exclude unmeasured sources and target candidates from roaming decisions.
 Neither path invents an average or replaces an absent measurement.
 
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/nl80211.c
 +++ b/nl80211.c
 @@ -269,6 +269,9 @@
