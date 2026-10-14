@@ -55,7 +55,7 @@ add_bool() {
 
 prepare_directory() {
 	local dir
-	config_get dir "$1" database_directory /etc/nlbwmon
+	config_get dir "$1" database_directory /var/lib/nlbwmon
 	mkdir -p "$dir" || config_failed=1
 }
 
@@ -65,7 +65,7 @@ parse_config() {
 	local cfg="$1"
 	local dir
 
-	config_get dir "$cfg" database_directory /etc/nlbwmon
+	config_get dir "$cfg" database_directory /var/lib/nlbwmon
 
 	procd_append_param command -o "$dir"
 

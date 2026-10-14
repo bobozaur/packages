@@ -1,5 +1,14 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] Publish accounting snapshots atomically and merge only validated data
 
+Validate complete input and reserve merge capacity before changing live
+counters. Publish a synced temporary inode by same-directory rename and
+report directory-sync failure independently of publication. Preserve an
+existing period encoding and defer shutdown saves to the native event loop.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/database.c
 +++ b/database.c
 @@ -22,6 +22,7 @@
@@ -606,13 +615,7 @@ Subject: [PATCH] Publish accounting snapshots atomically and merge only validate
  int
 --- a/nlbwmon.c
 +++ b/nlbwmon.c
-@@ -76,12 +76,12 @@
- 	.protocol_db = "/usr/share/nlbwmon/protocols",
- 
- 	.db = {
--		.directory = "/usr/share/nlbwmon/db"
-+		.directory = "/etc/nlbwmon"
- 	}
+@@ -81,7 +81,7 @@
  };
  
  
