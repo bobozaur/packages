@@ -97,6 +97,7 @@ PKG_MOD_AVAILABLE:= \
 	xcbc
 
 PKG_CONFIG_DEPENDS:= \
+	CONFIG_STRONGSWAN_IKEV1 \
 	CONFIG_STRONGSWAN_ROUTING_TABLE \
 	CONFIG_STRONGSWAN_ROUTING_TABLE_PRIO \
 	CONFIG_STRONGSWAN_INCLUDE_INSECURE \
@@ -437,7 +438,7 @@ CONFIGURE_ARGS+= \
 	--disable-static \
 	--enable-nonce \
 	--enable-mgf1 \
-	--enable-ikev1 \
+	$(if $(CONFIG_STRONGSWAN_IKEV1),--enable-ikev1,--disable-ikev1) \
 	--enable-mediation \
 	--with-systemdsystemunitdir=no \
 	PYTHON="python3" \
