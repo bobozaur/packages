@@ -6,6 +6,6 @@ case "$*" in
 		echo "/usr/libexec/ip-full"
 		;;
 	*)
-		command readlink "$@" 2>/dev/null || echo "$1"
+		/usr/bin/readlink "$@" 2>/dev/null || echo "$1"
 		;;
 esac
