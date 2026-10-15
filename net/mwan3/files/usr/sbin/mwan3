@@ -36,26 +36,30 @@ EOF
 ifdown() {
 	if [ -z "$1" ]; then
 		echo "Error: Expecting interface. Usage: mwan3 ifdown <interface>"
-		exit 0
+		exit 1
 	fi
 
 	if [ -n "$2" ]; then
 		echo "Error: Too many arguments. Usage: mwan3 ifdown <interface>"
-		exit 0
+		exit 1
 	fi
 
+	/etc/init.d/mwan3 running || return 1
+	local enabled
+	config_get_bool enabled "$1" enabled 0
+	[ "$enabled" = 1 ] || return 1
 	mwan3_interface_hotplug_shutdown "$1" 1
 }
 
 ifup() {
 	if [ -z "$1" ]; then
 		echo "Expecting interface. Usage: mwan3 ifup <interface>"
-		exit 0
+		exit 1
 	fi
 
 	if [ -n "$2" ]; then
 		echo "Too many arguments. Usage: mwan3 ifup <interface>"
-		exit 0
+		exit 1
 	fi
 
 	mwan3_ifup "$1" "cmd"
@@ -242,6 +246,7 @@ case "$1" in
 	ifup|ifdown|interfaces|policies|connected|rules|status|start|stop|restart|internal)
 		mwan3_init
 		"$@"
+		exit "$?"
 	;;
 	use)
 		mwan3_init

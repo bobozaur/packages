@@ -143,7 +143,7 @@ mwan3_set_custom_ipset()
 	fi
 
 	echo "$update" > "${MWAN3_STATUS_IPTABLES_LOG_DIR}/ipset-set_custom_ipset.dump"
-	error=$(echo "$update" | $IPS restore 2>&1) || LOG error "set_custom_ipset: $error"
+	error=$(echo "$update" | $IPS restore 2>&1) || { LOG error "set_custom_ipset: $error"; return 1; }
 }
 
 
@@ -181,7 +181,7 @@ mwan3_set_connected_ipv4()
 	mwan3_push_update add mwan3_connected_ipv4 224.0.0.0/3
 
 	echo "$update" > "${MWAN3_STATUS_IPTABLES_LOG_DIR}/ipset-set_connected_ipv4.dump"
-	error=$(echo "$update" | $IPS restore 2>&1) || LOG error "set_connected_ipv4: $error"
+	error=$(echo "$update" | $IPS restore 2>&1) || { LOG error "set_connected_ipv4: $error"; return 1; }
 }
 
 mwan3_set_connected_ipv6()
@@ -198,7 +198,7 @@ mwan3_set_connected_ipv6()
 	done
 
 	echo "$update" > "${MWAN3_STATUS_IPTABLES_LOG_DIR}/ipset-set_connected_ipv6.dump"
-	error=$(echo "$update" | $IPS restore 2>&1) || LOG error "set_connected_ipv6: $error"
+	error=$(echo "$update" | $IPS restore 2>&1) || { LOG error "set_connected_ipv6: $error"; return 1; }
 }
 
 mwan3_set_connected_ipset()
@@ -215,7 +215,7 @@ mwan3_set_connected_ipset()
 	fi
 
 	echo "$update" > "${MWAN3_STATUS_IPTABLES_LOG_DIR}/ipset-set_connected_ipset.dump"
-	error=$(echo "$update" | $IPS restore 2>&1) || LOG error "set_connected_ipset: $error"
+	error=$(echo "$update" | $IPS restore 2>&1) || { LOG error "set_connected_ipset: $error"; return 1; }
 }
 
 mwan3_set_dynamic_ipset()
@@ -232,7 +232,115 @@ mwan3_set_dynamic_ipset()
 	fi
 
 	echo "$update" > "${MWAN3_STATUS_IPTABLES_LOG_DIR}/ipset-set_dynamic_ipset.dump"
-	error=$(echo "$update" | $IPS restore 2>&1) || LOG error "set_dynamic_ipset: $error"
+	error=$(echo "$update" | $IPS restore 2>&1) || { LOG error "set_dynamic_ipset: $error"; return 1; }
+}
+
+# Both the table and protocol are part of route ownership. Refuse to share a
+# table with another producer, and use exclusive add even after this check.
+# A concurrent foreign insertion must never be overwritten by route replace.
+mwan3_table_routes()
+{
+	local routes
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$1" -ge 1 ] && [ "$1" -le 250 ] &&
+		[ "$1" -le "$MWAN3_INTERFACE_MAX" ] || return 1
+	# Dumping an absent numeric table fails; the all-table dump also represents
+	# an empty table successfully. Keep command failures distinct from emptiness.
+	routes=$($IP route list table all) || return 1
+	printf '%s\n' "$routes" | awk -v table="$1" '
+		{ for (i=1; i<NF; i++) if ($i == "table" && $(i+1) == table) {
+			sub(/ table [^ ]+/, ""); print; break
+		} }'
+}
+
+mwan3_route_table_available()
+{
+	local routes
+	routes=$(mwan3_table_routes "$1") || return 1
+	[ -z "$(printf '%s\n' "$routes" | sed '/^$/d; / proto '"$MWAN3_ROUTE_PROTOCOL"'\( \|$\)/d')" ]
+}
+
+mwan3_route_key()
+{
+	printf '%s\n' "$1" | awk '
+		{ dst=$1; from="all"; metric=0; tos=0;
+		  if ($1 ~ /^(unicast|local|broadcast|anycast|multicast|throw|unreachable|prohibit|blackhole|nat|xresolve|failed_policy)$/) {
+		    dst=$2;
+		  }
+		  if ($1 ~ /^[0-9]+$/) dst=$2;
+		  for (i=2; i<NF; i++) {
+		    if ($i == "from") from=$(i+1);
+		    if ($i == "metric") metric=$(i+1);
+		    if ($i == "tos") tos=$(i+1);
+		  }
+		  print dst, from, metric, tos;
+		}'
+}
+
+mwan3_route_change()
+{
+	local action="$1" table="$2" route="$3" owned line
+
+	route=$(printf '%s\n' "$route" | sed -ne "$MWAN3_ROUTE_LINE_EXP") || return 1
+	if [ "$action" = del ]; then
+		$IP route del table "$table" $route proto "$MWAN3_ROUTE_PROTOCOL"
+		return
+	fi
+	owned=$(mwan3_table_routes "$table") || return 1
+	[ -z "$(printf '%s\n' "$owned" | sed '/^$/d; / proto '"$MWAN3_ROUTE_PROTOCOL"'\( \|$\)/d')" ] || {
+		LOG err "Refusing foreign routes in table $table"
+		return 1
+	}
+	owned=$(printf '%s\n' "$owned" | sed -n '/ proto '"$MWAN3_ROUTE_PROTOCOL"'\( \|$\)/p')
+	# Keep an identical copy. On an update, withdraw only our exact old route
+	# to this destination; an exclusive add preserves an intervening producer.
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		[ "$(printf '%s\n' "$line" | sed -ne "$MWAN3_ROUTE_LINE_EXP")" = "$route" ] && return 0
+	done <<EOF
+$owned
+EOF
+	if [ "$action" = replace ]; then
+		while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			[ "$(mwan3_route_key "$line")" = "$(mwan3_route_key "$route")" ] || continue
+			line=$(printf '%s\n' "$line" | sed -ne "$MWAN3_ROUTE_LINE_EXP") || return 1
+			$IP route del table "$table" $line proto "$MWAN3_ROUTE_PROTOCOL" || return 1
+		done <<EOF
+$owned
+EOF
+	fi
+	$IP route add table "$table" $route proto "$MWAN3_ROUTE_PROTOCOL"
+}
+
+mwan3_check_routing_ownership()
+{
+	local IP id family pref conflict=0
+
+	check_interface() {
+		local id family enabled pref
+		config_get_bool enabled "$1" enabled 0
+		[ "$enabled" = 1 ] || return 0
+		config_get family "$1" family ipv4
+		[ "$family" = ipv6 ] && [ "$NO_IPV6" != 0 ] && return 0
+		[ "$family" = ipv4 ] && IP="$IP4" || IP="$IP6"
+		mwan3_get_iface_id id "$1"
+		mwan3_route_table_available "$id" || conflict=1
+		for pref in $((id+1000)) $((id+2000)) $((id+3000)); do
+			[ -z "$($IP rule list pref "$pref" | sed '/ proto\(col\)\? '"$MWAN3_ROUTE_PROTOCOL"'\( \|$\)/d')" ] || conflict=1
+		done
+	}
+	config_foreach check_interface interface
+	for IP in "$IP4" "$IP6"; do
+		[ "$IP" = "$IP6" ] && [ "$NO_IPV6" != 0 ] && continue
+		for pref in $((MM_BLACKHOLE+2000)) $((MM_UNREACHABLE+2000)); do
+			[ -z "$($IP rule list pref "$pref" | sed '/ proto\(col\)\? '"$MWAN3_ROUTE_PROTOCOL"'\( \|$\)/d')" ] || conflict=1
+		done
+	done
+	[ "$conflict" = 0 ] || {
+		LOG err "Routing table or rule priority is already owned; migrate legacy untagged mwan3 state explicitly"
+		return 1
+	}
 }
 
 mwan3_set_general_rules()
@@ -243,12 +351,12 @@ mwan3_set_general_rules()
 		[ "$IP" = "$IP6" ] && [ $NO_IPV6 -ne 0 ] && continue
 		RULE_NO=$((MM_BLACKHOLE+2000))
 		if [ -z "$($IP rule list | awk -v var="$RULE_NO:" '$1 == var')" ]; then
-			$IP rule add pref $RULE_NO fwmark $MMX_BLACKHOLE/$MMX_MASK blackhole
+			$IP rule add pref $RULE_NO fwmark $MMX_BLACKHOLE/$MMX_MASK blackhole protocol "$MWAN3_ROUTE_PROTOCOL"
 		fi
 
 		RULE_NO=$((MM_UNREACHABLE+2000))
 		if [ -z "$($IP rule list | awk -v var="$RULE_NO:" '$1 == var')" ]; then
-			$IP rule add pref $RULE_NO fwmark $MMX_UNREACHABLE/$MMX_MASK unreachable
+			$IP rule add pref $RULE_NO fwmark $MMX_UNREACHABLE/$MMX_MASK unreachable protocol "$MWAN3_ROUTE_PROTOCOL"
 		fi
 	done
 }
@@ -349,9 +457,9 @@ mwan3_set_general_iptables()
 
 		echo "$update" > "${MWAN3_STATUS_IPTABLES_LOG_DIR}/iptables-set_general_iptables-${family}.dump"
 		if [ "$IPT" = "$IPT4" ]; then
-			error=$(echo "$update" | $IPT4R 2>&1) || LOG error "set_general_iptables (${family}): $error"
+			error=$(echo "$update" | $IPT4R 2>&1) || { LOG error "set_general_iptables (${family}): $error"; return 1; }
 		else
-			error=$(echo "$update" | $IPT6R 2>&1) || LOG error "set_general_iptables (${family}): $error"
+			error=$(echo "$update" | $IPT6R 2>&1) || { LOG error "set_general_iptables (${family}): $error"; return 1; }
 		fi
 	done
 }
@@ -414,7 +522,7 @@ mwan3_create_iface_iptables()
 	mwan3_push_update ""
 
 	echo "$update" > "${MWAN3_STATUS_IPTABLES_LOG_DIR}/iptables-create_iface_iptables-${1}.dump"
-	error=$(echo "$update" | $IPTR 2>&1) || LOG error "create_iface_iptables (${1}): $error"
+	error=$(echo "$update" | $IPTR 2>&1) || { LOG error "create_iface_iptables (${1}): $error"; return 1; }
 }
 
 mwan3_delete_iface_iptables()
@@ -443,7 +551,7 @@ mwan3_delete_iface_iptables()
 	mwan3_push_update ""
 
 	echo "$update" > "${MWAN3_STATUS_IPTABLES_LOG_DIR}/iptables-delete_iface_iptables-${1}.dump"
-	error=$(echo "$update" | $IPTR 2>&1) || LOG error "delete_iface_iptables (${1}): $error"
+	error=$(echo "$update" | $IPTR 2>&1) || { LOG error "delete_iface_iptables (${1}): $error"; return 1; }
 }
 
 mwan3_extra_tables_routes()
@@ -473,7 +581,7 @@ mwan3_create_iface_route()
 		IP="$IP6"
 	fi
 
-	tbl=$($IP route list table $id 2>/dev/null)$'\n'
+	tbl=$($IP route list table $id proto "$MWAN3_ROUTE_PROTOCOL" 2>/dev/null | sed -ne "$MWAN3_ROUTE_LINE_EXP")$'\n'
 	mwan3_update_dev_to_table
 	mwan3_get_routes | while read -r route_line; do
 		mwan3_route_line_dev "tid" "$route_line" "$family"
@@ -482,8 +590,10 @@ mwan3_create_iface_route()
 			# possible that routes are already in the table
 			# if 'connected' was called after 'ifup'
 			[ -n "$tbl" ] && [ -z "${tbl##*$route_line$'\n'*}" ] && continue
-			$IP route add table $id $route_line ||
-				LOG debug "Route '$route_line' already added to table $id"
+			mwan3_route_change add "$id" "$route_line" || {
+				LOG err "Failed to copy route '$route_line' to table $id"
+				exit 1
+			}
 		fi
 
 	done
@@ -502,9 +612,9 @@ mwan3_delete_iface_route()
 	fi
 
 	if [ "$family" = "ipv4" ]; then
-		$IP4 route flush table "$id"
+		$IP4 route flush table "$id" proto "$MWAN3_ROUTE_PROTOCOL"
 	elif [ "$family" = "ipv6" ] && [ $NO_IPV6 -eq 0 ]; then
-		$IP6 route flush table "$id"
+		$IP6 route flush table "$id" proto "$MWAN3_ROUTE_PROTOCOL"
 	fi
 }
 
@@ -525,11 +635,11 @@ mwan3_create_iface_rules()
 		return
 	fi
 
-	mwan3_delete_iface_rules "$1"
+	mwan3_delete_iface_rules "$1" || return 1
 
-	$IP rule add pref $((id+1000)) iif "$2" lookup "$id"
-	$IP rule add pref $((id+2000)) fwmark "$(mwan3_id2mask id MMX_MASK)/$MMX_MASK" lookup "$id"
-	$IP rule add pref $((id+3000)) fwmark "$(mwan3_id2mask id MMX_MASK)/$MMX_MASK" unreachable
+	$IP rule add pref $((id+1000)) iif "$2" lookup "$id" protocol "$MWAN3_ROUTE_PROTOCOL" || return 1
+	$IP rule add pref $((id+2000)) fwmark "$(mwan3_id2mask id MMX_MASK)/$MMX_MASK" lookup "$id" protocol "$MWAN3_ROUTE_PROTOCOL" || return 1
+	$IP rule add pref $((id+3000)) fwmark "$(mwan3_id2mask id MMX_MASK)/$MMX_MASK" unreachable protocol "$MWAN3_ROUTE_PROTOCOL" || return 1
 }
 
 mwan3_delete_iface_rules()
@@ -549,9 +659,14 @@ mwan3_delete_iface_rules()
 		return
 	fi
 
-	for rule_id in $(ip rule list | awk -F : '$1 % 1000 == '$id' && $1 > 1000 && $1 < 4000 {print $1}'); do
-		$IP rule del pref $rule_id
+	local rules
+	for rule_id in $((id+1000)) $((id+2000)) $((id+3000)); do
+		rules=$($IP rule list pref "$rule_id") || return 1
+		if printf '%s\n' "$rules" | grep -q ' proto\(col\)\? '"$MWAN3_ROUTE_PROTOCOL"'\( \|$\)'; then
+			$IP rule del pref "$rule_id" protocol "$MWAN3_ROUTE_PROTOCOL" || return 1
+		fi
 	done
+	return 0
 }
 
 mwan3_delete_iface_ipset_entries()
@@ -612,7 +727,7 @@ mwan3_set_policy()
 			total_weight_v4=$((total_weight_v4+weight))
 			total_weight=$total_weight_v4
 		else
-			return
+			return 0
 		fi
 	elif [ "$family" = "ipv6" ] && [ $NO_IPV6 -eq 0 ] && [ $is_offline -eq 0 ]; then
 		if [ "$metric" -lt "$lowest_metric_v6" ]; then
@@ -623,7 +738,7 @@ mwan3_set_policy()
 			total_weight_v6=$((total_weight_v6+weight))
 			total_weight=$total_weight_v6
 		else
-			return
+			return 0
 		fi
 	fi
 	if [ $is_lowest -eq 1 ]; then
@@ -663,12 +778,12 @@ mwan3_set_policy()
 	mwan3_push_update ""
 
 	echo "$update" > "${MWAN3_STATUS_IPTABLES_LOG_DIR}/iptables-set_policy-${1}.dump"
-	error=$(echo "$update" | $IPTR 2>&1) || LOG error "set_policy ($1): $error"
+	error=$(echo "$update" | $IPTR 2>&1) || { LOG error "set_policy ($1): $error"; return 1; }
 }
 
 mwan3_create_policies_iptables()
 {
-	local last_resort lowest_metric_v4 lowest_metric_v6 total_weight_v4 total_weight_v6 policy IPT current update error
+	local last_resort lowest_metric_v4 lowest_metric_v6 total_weight_v4 total_weight_v6 policy IPT current update error member_failed=0
 
 	policy="$1"
 
@@ -713,9 +828,9 @@ mwan3_create_policies_iptables()
 
 		echo "$update" > "${MWAN3_STATUS_IPTABLES_LOG_DIR}/iptables-create_policies_iptables-${1}.dump"
 		if [ "$IPT" = "$IPT4" ]; then
-			error=$(echo "$update" | $IPT4R 2>&1) || LOG error "create_policies_iptables ($1): $error"
+			error=$(echo "$update" | $IPT4R 2>&1) || { LOG error "create_policies_iptables ($1): $error"; return 1; }
 		else
-			error=$(echo "$update" | $IPT6R 2>&1) || LOG error "create_policies_iptables ($1): $error"
+			error=$(echo "$update" | $IPT6R 2>&1) || { LOG error "create_policies_iptables ($1): $error"; return 1; }
 		fi
 	done
 
@@ -725,12 +840,21 @@ mwan3_create_policies_iptables()
 	lowest_metric_v6=$DEFAULT_LOWEST_METRIC
 	total_weight_v6=0
 
-	config_list_foreach "$1" use_member mwan3_set_policy
+	set_policy_checked() {
+		mwan3_set_policy "$@" || member_failed=1
+	}
+	config_list_foreach "$1" use_member set_policy_checked
+	[ "$member_failed" = 0 ]
 }
 
 mwan3_set_policies_iptables()
 {
-	config_foreach mwan3_create_policies_iptables policy
+	local policy_failed=0
+	create_policy_checked() {
+		mwan3_create_policies_iptables "$@" || policy_failed=1
+	}
+	config_foreach create_policy_checked policy
+	[ "$policy_failed" = 0 ]
 }
 
 mwan3_set_sticky_iptables()
@@ -779,7 +903,7 @@ mwan3_set_sticky_ipset()
 			timeout "$timeout" family inet6
 
 	echo "$update" > "${MWAN3_STATUS_IPTABLES_LOG_DIR}/ipset-set_sticky_ipset-${rule}.dump"
-	error=$(echo "$update" | $IPS restore 2>&1) || LOG error "set_sticky_ipset (${rule}): $error"
+	error=$(echo "$update" | $IPS restore 2>&1) || { LOG error "set_sticky_ipset (${rule}): $error"; return 1; }
 }
 
 mwan3_set_user_iptables_rule()
@@ -984,7 +1108,7 @@ mwan3_set_user_rules()
 		mwan3_push_update ""
 
 		echo "$update" > "${MWAN3_STATUS_IPTABLES_LOG_DIR}/iptables-set_user_rules-${ipv}.dump"
-		error=$(echo "$update" | $IPTR 2>&1) || LOG error "set_user_rules (${ipv}): $error"
+		error=$(echo "$update" | $IPTR 2>&1) || { LOG error "set_user_rules (${ipv}): $error"; return 1; }
 	done
 
 
@@ -1039,6 +1163,9 @@ mwan3_ifup()
 			exit 1
 		}
 		config_load mwan3
+		local enabled
+		config_get_bool enabled "$interface" enabled 0
+		[ "$enabled" = 1 ] || return 1
 	fi
 	mwan3_get_true_iface true_iface $interface
 	status=$(ubus -S call network.interface.$true_iface status)
@@ -1057,7 +1184,7 @@ mwan3_ifup()
 	if [ "$up" != "1" ] || [ -z "$l3_device" ]; then
 		echo "The network interace '${interface}' is not up."
 		echo "Please execute 'ifup ${interface}' first."
-		return
+		return 1
 	fi
 
 	if [ "${caller}" = "init" ]; then
