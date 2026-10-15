@@ -1,0 +1,536 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] nftables: retain native IPv6 pinhole rule identity
+
+Refresh live kernel state and allocate unused pinhole IDs. Preserve ingress
+identity, protocol, counters and acknowledged replacement by handle, including
+IPv6 extension headers and missing-rule versus backend errors.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/netfilter_nft/nftnlrdr_misc.c
++++ b/netfilter_nft/nftnlrdr_misc.c
+@@ -249,7 +249,6 @@
+ static void
+ parse_rule_counter(struct nftnl_expr *e, rule_t *r)
+ {
+-	r->type = RULE_COUNTER;
+ 	r->bytes = nftnl_expr_get_u64(e, NFTNL_EXPR_CTR_BYTES);
+ 	r->packets = nftnl_expr_get_u64(e, NFTNL_EXPR_CTR_PACKETS);
+ }
+@@ -263,6 +262,12 @@
+ 
+ 	/* ToDo: body of both cases are identical - bug? */
+ 	switch (key) {
++	case NFT_META_L4PROTO:
++		set_reg(r, dreg, RULE_REG_IP6_PROTO, 0);
++		break;
++	case NFT_META_NFPROTO:
++		set_reg(r, dreg, RULE_REG_NONE, 0);
++		break;
+ 	case NFT_META_IIF:
+ 		reg_type = RULE_REG_IIF;
+ 		set_reg(r, dreg, reg_type, 0);
+@@ -642,6 +647,13 @@
+ #undef CB_DATA
+ 
+ int
++refresh_nft_cache_filter_fresh(void)
++{
++	rule_list_filter_validate = RULE_CACHE_INVALID;
++	return refresh_nft_cache_filter();
++}
++
++int
+ refresh_nft_cache_filter(void)
+ {
+ 	if (rule_list_filter_validate != RULE_CACHE_VALID) {
+@@ -1107,12 +1119,14 @@
+  * rport is the (optional) source port of the rule
+  */
+ struct nftnl_rule *
+-rule_set_filter6(uint8_t family, const char * ifname, uint8_t proto,
++rule_set_filter6(uint8_t family, uint32_t ifindex, uint8_t proto,
+ 		struct in6_addr *rhost6, struct in6_addr *iaddr6,
+ 		unsigned short eport, unsigned short iport,
+-		unsigned short rport, const char *descr, const char *handle)
++		unsigned short rport, const char *descr, const rule_t *previous)
+ {
+ 	struct nftnl_rule *r = NULL;
++	struct nftnl_expr *counter;
++	uint8_t nfproto = NFPROTO_IPV6;
+ 
+ 	r = nftnl_rule_alloc();
+ 	if (r == NULL) {
+@@ -1120,7 +1134,19 @@
+ 		return NULL;
+ 	}
+ 
+-	r = rule_set_filter_common(r, family, ifname, proto, eport, iport, rport, descr, handle);
++	r = rule_set_filter_common(r, family, NULL, proto, eport, iport, rport, descr, NULL);
++	if (previous)
++		nftnl_rule_set_u64(r, NFTNL_RULE_HANDLE, previous->handle);
++#ifdef USE_IFNAME_IN_RULES
++	if (ifindex) {
++		expr_add_meta(r, NFT_META_IIF, NFT_REG_1);
++		expr_add_cmp(r, NFT_REG_1, NFT_CMP_EQ, &ifindex, sizeof(ifindex));
++	}
++#else
++	UNUSED(ifindex);
++#endif
++	expr_add_meta(r, NFT_META_NFPROTO, NFT_REG_1);
++	expr_add_cmp(r, NFT_REG_1, NFT_CMP_EQ, &nfproto, sizeof(nfproto));
+ 
+ 	/* Destination IP */
+ 	expr_add_payload(r, NFT_PAYLOAD_NETWORK_HEADER, NFT_REG_1,
+@@ -1135,10 +1161,17 @@
+ 	}
+ 
+ 	/* Protocol */
+-	expr_add_payload(r, NFT_PAYLOAD_NETWORK_HEADER, NFT_REG_1,
+-	                 offsetof(struct ipv6hdr, nexthdr), sizeof(uint8_t));
++	expr_add_meta(r, NFT_META_L4PROTO, NFT_REG_1);
+ 	expr_add_cmp(r, NFT_REG_1, NFT_CMP_EQ, &proto, sizeof(uint8_t));
+ 
++	counter = nftnl_expr_alloc("counter");
++	if (!counter) {
++		nftnl_rule_free(r);
++		return NULL;
++	}
++	nftnl_expr_set_u64(counter, NFTNL_EXPR_CTR_PACKETS, previous ? previous->packets : 0);
++	nftnl_expr_set_u64(counter, NFTNL_EXPR_CTR_BYTES, previous ? previous->bytes : 0);
++	nftnl_rule_add_expr(r, counter);
+ 	expr_set_reg_verdict(r, NF_ACCEPT);
+ 
+ 	debug_rule(r);
+@@ -1255,14 +1288,16 @@
+ 	nfg->res_id = NFNL_SUBSYS_NFTABLES;
+ }
+ 
+-int
+-nft_send_rule(struct nftnl_rule * rule, uint16_t cmd, enum rule_chain_type chain_type)
++static int
++nft_send_rule_flags(struct nftnl_rule * rule, uint16_t cmd, enum rule_chain_type chain_type, uint16_t flags)
+ {
+ 	int result = -1;
+ 	struct nlmsghdr *nlh;
+ 	struct mnl_nlmsg_batch *batch;
+ 	char buf[MNL_SOCKET_BUFFER_SIZE*2];
+ 
++	if (!rule)
++		return -1;
+ 	batch = start_batch(buf, MNL_SOCKET_BUFFER_SIZE);
+ 	if (batch != NULL)
+ 	{
+@@ -1280,7 +1315,7 @@
+ 		nlh = nftnl_rule_nlmsg_build_hdr(mnl_nlmsg_batch_current(batch),
+ 		                                 cmd,
+ 		                                 nftnl_rule_get_u32(rule, NFTNL_RULE_FAMILY),
+-		                                 NLM_F_APPEND|NLM_F_CREATE|NLM_F_ACK,
++		                                 flags|NLM_F_ACK,
+ 		                                 mnl_seq++);
+ 
+ 		nftnl_rule_nlmsg_build_payload(nlh, rule);
+@@ -1291,9 +1326,23 @@
+ 			syslog(LOG_ERR, "%s(%p, %d, %d) send_batch failed %d",
+ 			       "nft_send_rule", rule, (int)cmd, (int)chain_type, result);
+ 		}
++	} else {
++		nftnl_rule_free(rule);
+ 	}
+ 
+ 	return result;
++}
++
++int
++nft_send_rule(struct nftnl_rule *rule, uint16_t cmd, enum rule_chain_type type)
++{
++	return nft_send_rule_flags(rule, cmd, type, NLM_F_APPEND | NLM_F_CREATE);
++}
++
++int
++nft_replace_rule(struct nftnl_rule *rule, enum rule_chain_type type)
++{
++	return nft_send_rule_flags(rule, NFT_MSG_NEWRULE, type, NLM_F_REPLACE);
+ }
+ 
+ int
+--- a/netfilter_nft/nftpinhole.c
++++ b/netfilter_nft/nftpinhole.c
+@@ -68,6 +68,32 @@
+ /*
+ ip saddr <rem_host> ip daddr <int_client> tcp sport <rem_port>  tcp dport <int_port>
+ */
++/* Reconstruct allocation from the kernel, including surviving rules after a
++ * daemon restart. The bounded bitmap also prevents collisions after UID wrap. */
++static int allocate_uid(void)
++{
++	unsigned char used[8192] = {0};
++	rule_t *p;
++	int uid;
++	unsigned int timestamp;
++	if (refresh_nft_cache_filter_fresh() < 0)
++		return -1;
++	LIST_FOREACH(p, &head_filter, entry) {
++		if (p->type == RULE_FILTER && p->desc_len &&
++		    sscanf(p->desc, PINEHOLE_LABEL_FORMAT_SKIPDESC, &uid, &timestamp) == 2 &&
++		    uid > 0 && uid < 65535)
++			used[uid / 8] |= 1U << (uid % 8);
++	}
++	uid = next_uid;
++	do {
++		if (!(used[uid / 8] & (1U << (uid % 8))))
++			return uid;
++		if (++uid >= 65535)
++			uid = 1;
++	} while (uid != next_uid);
++	return -1;
++}
++
+ int add_pinhole(const char * ifname,
+                 const char * rem_host, unsigned short rem_port,
+                 const char * int_client, unsigned short int_port,
+@@ -80,24 +106,31 @@
+ 	struct in6_addr rhost_addr, ihost_addr;
+ 	struct in6_addr *rhost_addr_p;
+ 
+-	uid = next_uid;
++	uint32_t ifindex = ifname ? if_nametoindex(ifname) : 0;
++	if (ifname && !ifindex)
++		return -1;
++	uid = allocate_uid();
++	if (uid < 0)
++		return -1;
+ 
+ 	d_printf(("add_pinhole(%s, %s, %hu, %s, %hu, %d, %s, %u)\n",
+ 	          ifname, rem_host, rem_port, int_client, int_port, proto, desc, timestamp));
+ 
+ 	if (rem_host && rem_host[0] != '\0' && rem_host[0] != '*') {
+-		inet_pton(AF_INET6, rem_host, &rhost_addr);
++		if (inet_pton(AF_INET6, rem_host, &rhost_addr) != 1)
++			return -1;
+ 		rhost_addr_p = &rhost_addr;
+ 	} else {
+ 		rhost_addr_p = NULL;
+ 	}
+ 
+-	inet_pton(AF_INET6, int_client, &ihost_addr);
++	if (inet_pton(AF_INET6, int_client, &ihost_addr) != 1)
++		return -1;
+ 
+ 	snprintf(comment, NFT_DESCR_SIZE,
+ 		         PINEHOLE_LABEL_FORMAT, uid, timestamp, desc);
+ 
+-	r = rule_set_filter6(nft_ipv6_family, ifname, proto,
++	r = rule_set_filter6(nft_ipv6_family, ifindex, proto,
+ 			    rhost_addr_p, &ihost_addr,
+ 				0, int_port, rem_port, comment, 0);
+ 
+@@ -106,7 +139,8 @@
+ 	if (res < 0)
+ 		return -1;
+ 
+-	if (++next_uid >= 65535) {
++	next_uid = uid + 1;
++	if (next_uid >= 65535) {
+ 		next_uid = 1;
+ 	}
+ 
+@@ -130,7 +164,7 @@
+ 	if (rem_host && rem_host[0] != '\0' && rem_host[0] != '*') {
+ 		if (inet_pton(AF_INET6, rem_host, &saddr) < 1) {
+ 			syslog(LOG_WARNING, "Failed to parse INET6 address \"%s\"", rem_host);
+-			memset(&saddr, 0, sizeof(struct in6_addr));
++			return -1;
+ 		}
+ 	} else {
+ 		memset(&saddr, 0, sizeof(struct in6_addr));
+@@ -138,11 +172,12 @@
+ 
+ 	if (inet_pton(AF_INET6, int_client, &daddr) < 1) {
+ 		syslog(LOG_WARNING, "Failed to parse INET6 address \"%s\"", int_client);
+-		memset(&daddr, 0, sizeof(struct in6_addr));
++		return -1;
+ 	}
+ 
+ 	d_printf(("find_pinhole()\n"));
+-	refresh_nft_cache_filter();
++	if (refresh_nft_cache_filter_fresh() < 0)
++		return -1;
+ 
+ 	LIST_FOREACH(p, &head_filter, entry) {
+ 
+@@ -194,7 +229,8 @@
+ 	         "pinhole-%hu", uid);
+ 
+ 	d_printf(("delete_pinhole()\n"));
+-	refresh_nft_cache_filter();
++	if (refresh_nft_cache_filter_fresh() < 0)
++		return -1;
+ 
+ 	LIST_FOREACH(p, &head_filter, entry) {
+ 		// Only forward entries
+@@ -210,8 +246,7 @@
+ 		/* compare the uid value */
+ 		if (0 == strcmp(tmp_label, label_start)) {
+ 			r = rule_del_handle(p);
+-			nft_send_rule(r, NFT_MSG_DELRULE, RULE_CHAIN_FILTER);
+-			return 0;
++			return nft_send_rule(r, NFT_MSG_DELRULE, RULE_CHAIN_FILTER) < 0 ? -1 : 0;
+ 		}
+ 	}
+ 
+@@ -221,114 +256,35 @@
+ int
+ update_pinhole(unsigned short uid, unsigned int timestamp)
+ {
+-#ifdef DEBUG
+-	char iaddr[INET6_ADDRSTRLEN];
+-#endif
+-	char raddr[INET6_ADDRSTRLEN];
+-	char label_start[NFT_DESCR_SIZE];
+-	char tmp_label[NFT_DESCR_SIZE];
+-	char desc[NFT_DESCR_SIZE];
+-	char ifname[IFNAMSIZ];
++	rule_t *p;
++	const char *desc;
++	struct nftnl_rule *r;
+ 	char comment[NFT_DESCR_SIZE];
+-	uint32_t ext_if_indx;
+-	int proto, res;
+-	unsigned short iport, rport;
+-	rule_t *p;
+-	struct in6_addr rhost_addr, ihost_addr;
+-	struct in6_addr * rhost_addr_p;
+-	struct nftnl_rule *r;
+-
+-	d_printf(("update_pinhole()\n"));
+-
+-	snprintf(label_start, sizeof(label_start),
+-	         "pinhole-%hu", uid);
+-
+-	refresh_nft_cache_filter();
+-
+-	proto = -1;
+-	memset(&rhost_addr, 0, sizeof(struct in6_addr));
+-
+-	LIST_FOREACH(p, &head_filter, entry) {
+-		// Only forward entries
+-		if (p->type != RULE_FILTER)
+-			continue;
+-
+-		if (p->desc_len == 0)
+-			continue;
+-
+-		strncpy(tmp_label, p->desc, sizeof(tmp_label));
+-		tmp_label[sizeof(tmp_label) - 1] = '\0';
+-		strtok(tmp_label, " ");
+-		/* check for the right uid */
+-		if (0 == strcmp(tmp_label, label_start)) {
+-			char *pd;
+-			/* Source IP Address */
+-			// Check if empty
+-			if (0 == memcmp(&rhost_addr, &p->saddr6, sizeof(struct in6_addr))) {
+-				rhost_addr_p = NULL;
+-				raddr[0] = '*';
+-				raddr[1] = '\0';
+-			} else {
+-				rhost_addr_p = &p->saddr6;
+-				if (inet_ntop(AF_INET6, rhost_addr_p, raddr, INET6_ADDRSTRLEN) == NULL) {
+-					syslog(LOG_WARNING, "%s: inet_ntop(raddr): %m", "update_pinhole");
+-				}
+-			}
+-
+-			/* Source Port */
+-			rport = p->sport;
+-
+-			/* Destination IP Address */
+-			ihost_addr = p->daddr6;
+-
+-			/* Destination Port */
+-			iport = p->dport;
+-
+-			proto = p->proto;
+-
+-			ext_if_indx = p->ingress_ifidx;
+-			if_indextoname(ext_if_indx, ifname);
+-
+-			pd = strchr(p->desc, ':');
+-			if (pd) {
+-				pd += 2;
+-				strncpy(desc, pd, sizeof(desc));
+-				desc[sizeof(desc) - 1] = '\0';
+-			} else {
+-				desc[0] = '\0';
+-			}
+-
+-			break;
+-		}
+-	}
+-
+-	if (proto == -1)
+-		return -2;
+-
+-	// Delete rule
+-	r = rule_del_handle(p);
+-	res = nft_send_rule(r, NFT_MSG_DELRULE, RULE_CHAIN_FILTER);
+-
+-	if (res < 0)
+-		return -1;
+-
+-	// readd rule with new timestamp
+-	snprintf(comment, NFT_DESCR_SIZE,
+-		         PINEHOLE_LABEL_FORMAT, uid, timestamp, desc);
+-
+-	d_printf(("update add_pinhole(%s, %s, %s, %d, %d, %d, %s)\n",
+-	          ifname, raddr, inet_ntop(AF_INET6, &ihost_addr, iaddr, INET6_ADDRSTRLEN), rport, iport, proto, comment));
+-
+-	r = rule_set_filter6(nft_ipv6_family, ifname, proto,
+-			    rhost_addr_p, &ihost_addr,
+-				0, iport, rport, comment, 0);
+-
+-	res = nft_send_rule(r, NFT_MSG_NEWRULE, RULE_CHAIN_FILTER);
+-
+-	if (res < 0)
+-		return -1;
+-
+-	return 0;
++	int found_uid;
++	unsigned int old_timestamp;
++	if (refresh_nft_cache_filter_fresh() < 0)
++		return -1;
++	LIST_FOREACH(p, &head_filter, entry) {
++		if (p->type != RULE_FILTER || !p->desc_len ||
++		    sscanf(p->desc, PINEHOLE_LABEL_FORMAT_SKIPDESC, &found_uid, &old_timestamp) != 2 ||
++		    found_uid != uid)
++			continue;
++		desc = strchr(p->desc, ':');
++		if (desc) {
++			desc++;
++			if (*desc == ' ') desc++;
++		} else {
++			desc = "";
++		}
++		snprintf(comment, sizeof(comment), PINEHOLE_LABEL_FORMAT, uid, timestamp, desc);
++		/* Replacing by handle commits the new lease without first removing
++		 * the old permit. Preserve ingress identity and sampled counters. */
++		r = rule_set_filter6(nft_ipv6_family, p->ingress_ifidx,
++			p->proto, IN6_IS_ADDR_UNSPECIFIED(&p->saddr6) ? NULL : &p->saddr6,
++			&p->daddr6, 0, p->dport, p->sport, comment, p);
++		return nft_replace_rule(r, RULE_CHAIN_FILTER) < 0 ? -1 : 0;
++	}
++	return -2;
+ }
+ 
+ int
+@@ -350,7 +306,8 @@
+ 	         "pinhole-%hu", uid);
+ 
+ 	d_printf(("get_pinhole_info()\n"));
+-	refresh_nft_cache_filter();
++	if (refresh_nft_cache_filter_fresh() < 0)
++		return -1;
+ 
+ 	LIST_FOREACH(p, &head_filter, entry) {
+ 		// Only forward entries
+@@ -419,13 +376,13 @@
+ 					*bytes = p->bytes;
+ 			}
+ 
+-			break;
++			return 0;
+ 		}
+ 	}
+ 
+ 	d_printf(("end_pinhole_info()\n"));
+ 
+-	return 0;
++	return -2;
+ }
+ 
+ int get_pinhole_uid_by_index(int index)
+@@ -443,13 +400,17 @@
+ 	unsigned int ts;
+ 	int uid;
+ 	unsigned int min_ts = UINT_MAX;
+-	int min_uid = INT_MAX, max_uid = -1;
++	int failed = 0;
+ 	int n = 0;
+ 
+ 	current_time = upnp_time();
+ 
+ 	d_printf(("clean_pinhole_list()\n"));
+-	refresh_nft_cache_filter();
++	if (refresh_nft_cache_filter() < 0) {
++		if (next_timestamp)
++			*next_timestamp = (unsigned int)current_time + 1;
++		return -1;
++	}
+ 
+ 	LIST_FOREACH(p, &head_filter, entry) {
+ 		// Only forward entries
+@@ -467,13 +428,14 @@
+ 		if (ts <= (unsigned int)current_time) {
+ 			syslog(LOG_INFO, "removing expired pinhole '%s'", p->desc);
+ 			r = rule_del_handle(p);
+-			nft_send_rule(r, NFT_MSG_DELRULE, RULE_CHAIN_FILTER);
+-			n++;
++			if (nft_send_rule(r, NFT_MSG_DELRULE, RULE_CHAIN_FILTER) < 0) {
++				failed = 1;
++				if ((unsigned int)current_time + 1 < min_ts)
++					min_ts = (unsigned int)current_time + 1;
++			} else {
++				n++;
++			}
+ 		} else {
+-			if (uid > max_uid)
+-				max_uid = uid;
+-			else if (uid < min_uid)
+-				min_uid = uid;
+ 			if (ts < min_ts)
+ 				min_ts = ts;
+ 		}
+@@ -482,17 +444,7 @@
+ 	if (next_timestamp && (min_ts != UINT_MAX))
+ 		*next_timestamp = min_ts;
+ 
+-	if (max_uid > 0) {
+-		if (((min_uid - 32000) <= next_uid) && (next_uid <= max_uid)) {
+-			next_uid = max_uid + 1;
+-		}
+-
+-		if (next_uid >= 65535) {
+-			next_uid = 1;
+-		}
+-	}
+-
+-	return n;	/* number of rules removed */
++	return failed ? -1 : n;	/* preserve failed leases for a bounded retry */
+ }
+ 
+ #endif /* ENABLE_UPNPPINHOLE */
+--- a/netfilter_nft/nftnlrdr_misc.h
++++ b/netfilter_nft/nftnlrdr_misc.h
+@@ -110,6 +110,9 @@
+ #define debug_rule(rule)
+ #endif
+ 
++int refresh_nft_cache_filter_fresh(void);
++int nft_replace_rule(struct nftnl_rule *rule, enum rule_chain_type type);
++
+ int
+ nft_send_rule(struct nftnl_rule * rule, uint16_t cmd, enum rule_chain_type type);
+ struct nftnl_rule *
+@@ -131,10 +134,10 @@
+ 		unsigned short eport, unsigned short iport,
+ 		unsigned short rport, const char * descr, const char *handle);
+ struct nftnl_rule *
+-rule_set_filter6(uint8_t family, const char * ifname, uint8_t proto,
++rule_set_filter6(uint8_t family, uint32_t ifindex, uint8_t proto,
+ 		struct in6_addr *rhost6, struct in6_addr *iaddr6,
+ 		unsigned short eport, unsigned short iport, 
+-		unsigned short rport, const char *descr, const char *handle);
++		unsigned short rport, const char *descr, const rule_t *previous);
+ struct nftnl_rule *
+ rule_set_filter_common(struct nftnl_rule *r, uint8_t family, const char * ifname,
+ 		uint8_t proto, unsigned short eport, unsigned short iport, 
