@@ -9,7 +9,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mwan3
 PKG_VERSION:=2.12.2
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 
 PKG_MAINTAINER:=Florian Eckert <fe@dev.tdt.de>
 PKG_LICENSE:=GPL-2.0
@@ -28,7 +28,7 @@ define Package/mwan3
      +IPV6:ip6tables \
      +iptables-mod-conntrack-extra \
      +iptables-mod-ipopt \
-     +rpcd-mod-ucode \
+     +rpcd-mod-ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-ubus \
      +jshn
    TITLE:=Multiwan hotplug script with connection tracking support
    MAINTAINER:=Florian Eckert <fe@dev.tdt.de>
@@ -44,6 +44,24 @@ endef
 define Package/mwan3/conffiles
 /etc/config/mwan3
 /etc/mwan3.user
+endef
+
+define Package/mwan3/preinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+[ "$${IPKG_NO_SCRIPT}" = "1" ] && exit 0
+[ "$${PKG_UPGRADE}" = "1" ] || exit 0
+
+initscript=/etc/init.d/mwan3
+. /lib/functions/procd.sh
+flock -n 1000 || exit 1
+
+# A package that never started owns no state; include respawning instances.
+service="$$(ubus call service list '{"name":"mwan3"}')" || exit 1
+[ -n "$$(jsonfilter -s "$$service" -l 1 -e '@.mwan3.instances[*].running')" ] || exit 0
+
+# Retire the previous version's state while its cleanup code is still installed.
+exec "$$initscript" stop
 endef
 
 define Package/mwan3/postinst
@@ -72,6 +90,8 @@ define Build/Compile
 endef
 
 define Package/mwan3/install
+	$(INSTALL_DIR) $(1)/etc/iproute2/rt_protos.d
+	$(INSTALL_DATA) ./files/mwan3-protocol.conf $(1)/etc/iproute2/rt_protos.d/mwan3.conf
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/etc/config/mwan3 \
 		$(1)/etc/config/
