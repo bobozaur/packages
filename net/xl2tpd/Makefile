@@ -9,7 +9,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=xl2tpd
 PKG_VERSION:=1.3.18
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 PKG_MAINTAINER:=Yousong Zhou <yszhou4tech@gmail.com>
 PKG_LICENSE:=GPL-2.0
 PKG_LICENSE_FILES:=LICENSE
@@ -31,7 +31,8 @@ define Package/xl2tpd
   TITLE:=An L2TP (Layer 2 Tunneling Protocol) daemon
   URL:=https://github.com/xelerance/xl2tpd
   SUBMENU:=VPN
-  DEPENDS:=+ppp-mod-pppol2tp +resolveip
+  DEPENDS:=+ppp-mod-pppol2tp +resolveip +netifd +ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-ubus
+  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r2)
 endef
 
 define Package/xl2tpd/description
@@ -74,6 +75,9 @@ define Package/xl2tpd/install
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/xl2tpd.init $(1)/etc/init.d/xl2tpd
+	$(INSTALL_DIR) $(1)/usr/share/xl2tpd
+	$(INSTALL_DATA) ./files/xl2tpd.uc $(1)/usr/share/xl2tpd/uci.uc
+	$(INSTALL_DATA) ./files/lac-reload.uc $(1)/usr/share/xl2tpd/lac-reload.uc
 
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/xl2tp.config \
