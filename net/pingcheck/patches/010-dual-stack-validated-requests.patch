@@ -1,0 +1,569 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] pingcheck: validate dual-stack requests and close failed sockets
+
+Use address-family-specific ICMP and TCP sockets, resolve into sockaddr_storage,
+and require the current request cookie, sequence, sender and payload. Track
+active sockets and outstanding replies explicitly, including descriptor zero.
+The legacy configuration continues to select IPv4 until the schema patch.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/icmp.c
++++ b/icmp.c
+@@ -16,6 +16,8 @@
+ 
+ /* keep libc includes before linux headers for musl compatibility */
+ #include <netinet/in.h>
++#include <netinet/icmp6.h>
++#include <sys/random.h>
+ 
+ #include <err.h>
+ #include <linux/icmp.h>
+@@ -26,105 +28,93 @@
+ #include <sys/socket.h>
+ #include <unistd.h>
+ 
+-static int pid = -1;
++/* One outstanding request per probe. A fresh cookie also rejects replies
++ * from a previous socket, interface incarnation or counter reset. */
++struct echo_packet {
++	struct icmphdr header;
++	uint8_t cookie[16];
++};
+ 
+-/* standard 1s complement checksum */
+-static unsigned short checksum(void* b, int len)
++static uint16_t checksum(const void* data, size_t len)
+ {
+-	unsigned short* buf = b;
++	const uint8_t* bytes = data;
+ 	unsigned int sum = 0;
+-	unsigned short result;
+-
+-	for (sum = 0; len > 1; len -= 2) {
+-		sum += *buf++;
+-	}
+-	if (len == 1) {
+-		sum += *(unsigned char*)buf;
+-	}
+-	sum = (sum >> 16) + (sum & 0xFFFF);
+-	sum += (sum >> 16);
+-	result = ~sum;
+-	return result;
++	for (; len > 1; len -= 2, bytes += 2)
++		sum += ((unsigned int)bytes[0] << 8) | bytes[1];
++	if (len)
++		sum += (unsigned int)bytes[0] << 8;
++	while (sum >> 16)
++		sum = (sum & 0xffff) + (sum >> 16);
++	return htons(~sum);
+ }
+ 
+-int icmp_init(const char* ifname)
++int icmp_init(const char* ifname, int family)
+ {
+-	int ret;
+-	pid = getpid();
+-
+-	int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+-	if (fd == -1) {
+-		warn("Could not open socket");
++	int fd = socket(family, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
++					family == AF_INET6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
++	if (fd < 0)
+ 		return -1;
+-	}
+-
+-	if (ifname != NULL) {
+-		if (strlen(ifname) >= IFNAMSIZ) {
+-			fprintf(stderr, "icmp_init: ifname too long");
+-			return -1;
+-		}
+-		struct ifreq ifr;
+-		strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+-		ret = setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr));
+-		if (ret < 0) {
+-			warn("Could not bind to '%s'", ifname);
+-			close(fd);
+-			return -1;
+-		}
++	if (!ifname || !*ifname || strlen(ifname) >= IFNAMSIZ ||
++		setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname) + 1)) {
++		close(fd);
++		return -1;
+ 	}
+ 	return fd;
+ }
+ 
+-bool icmp_echo_send(int fd, int dst_ip, int cnt)
++bool icmp_echo_send(struct ping_intf* pi)
+ {
+-	char buf[500];
+-	int ret;
+-	struct sockaddr_in addr;
+-
+-	addr.sin_family = AF_INET;
+-	addr.sin_port = 0;
+-	addr.sin_addr.s_addr = dst_ip;
+-
+-	struct icmphdr* icmp = (struct icmphdr*)buf;
+-
+-	icmp->type = ICMP_ECHO;
+-	icmp->code = 0;
+-	icmp->un.echo.id = htons(pid + fd);
+-	icmp->un.echo.sequence = htons(cnt);
+-	icmp->checksum = 0;
+-	icmp->checksum = checksum(buf, sizeof(struct icmphdr));
+-
+-	ret = sendto(fd, &buf, sizeof(struct icmphdr), 0, (struct sockaddr*)&addr,
+-				 sizeof(addr));
+-	if (ret <= 0) {
+-		warn("sendto");
++	struct echo_packet packet = {0};
++	bool v6 = pi->conf_family == AF_INET6;
++	if (getrandom(pi->echo_cookie, sizeof(pi->echo_cookie), 0) !=
++		(ssize_t)sizeof(pi->echo_cookie))
+ 		return false;
+-	}
+-	return true;
++	pi->echo_seq++;
++	packet.header.type = v6 ? ICMP6_ECHO_REQUEST : ICMP_ECHO;
++	packet.header.un.echo.id = htons(getpid());
++	packet.header.un.echo.sequence = htons(pi->echo_seq);
++	memcpy(packet.cookie, pi->echo_cookie, sizeof(packet.cookie));
++	/* Linux computes the ICMPv6 pseudoheader checksum for raw ICMPv6. */
++	if (!v6)
++		packet.header.checksum = checksum(&packet, sizeof(packet));
++	return sendto(pi->ufd.fd, &packet, sizeof(packet), 0,
++				  (struct sockaddr*)&pi->conf_host,
++				  v6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in)) ==
++		(ssize_t)sizeof(packet);
+ }
+ 
+-int icmp_echo_receive(int fd)
++bool icmp_echo_receive(struct ping_intf* pi)
+ {
+-	char buf[500];
+-	int ret;
+-
+-	ret = recv(fd, buf, sizeof(buf), 0);
+-	if (ret < (int)(sizeof(struct icmphdr) + sizeof(struct iphdr))) {
+-		warn("received packet too short");
+-		return -1;
++	uint8_t data[2048];
++	struct sockaddr_storage src = {0};
++	socklen_t src_len = sizeof(src);
++	ssize_t len = recvfrom(pi->ufd.fd, data, sizeof(data), 0,
++						   (struct sockaddr*)&src, &src_len);
++	bool v6 = pi->conf_family == AF_INET6;
++	size_t offset = 0;
++	if (len < 0 || !pi->awaiting_reply || src.ss_family != pi->conf_family)
++		return false;
++	if (v6) {
++		if (memcmp(&((struct sockaddr_in6*)&src)->sin6_addr,
++				   &((struct sockaddr_in6*)&pi->conf_host)->sin6_addr,
++				   sizeof(struct in6_addr)))
++			return false;
++	} else {
++		if (len < 20 || data[0] >> 4 != 4 ||
++			((struct sockaddr_in*)&src)->sin_addr.s_addr !=
++			((struct sockaddr_in*)&pi->conf_host)->sin_addr.s_addr)
++			return false;
++		offset = (data[0] & 15) * 4;
++		if (offset < 20 || offset > (size_t)len)
++			return false;
+ 	}
+-
+-	struct iphdr* ip = (struct iphdr*)buf;
+-	struct icmphdr* icmp = (struct icmphdr*)(buf + ip->ihl * 4);
+-
+-	int csum_recv = icmp->checksum;
+-	icmp->checksum = 0; // need to zero before calculating checksum
+-	int csum_calc = checksum(icmp, sizeof(struct icmphdr));
+-	int received_fd = ntohs(icmp->un.echo.id) - pid;
+-	if (csum_recv == csum_calc &&		// checksum correct
+-		icmp->type == ICMP_ECHOREPLY && // correct type
+-		received_fd >= 0) {				// handle could be valid
+-		return received_fd;
+-	}
+-	return -1;
++	if ((size_t)len - offset != sizeof(struct echo_packet))
++		return false;
++	struct echo_packet packet;
++	memcpy(&packet, data + offset, sizeof(packet));
++	return packet.header.type == (v6 ? ICMP6_ECHO_REPLY : ICMP_ECHOREPLY) &&
++		!packet.header.code && packet.header.un.echo.id == htons(getpid()) &&
++		packet.header.un.echo.sequence == htons(pi->echo_seq) &&
++		!memcmp(packet.cookie, pi->echo_cookie, sizeof(packet.cookie)) &&
++		(v6 || !checksum(data + offset, sizeof(packet)));
+ }
+--- a/main.h
++++ b/main.h
+@@ -15,6 +15,8 @@
+ #include <libubox/runqueue.h>
+ #include <libubox/uloop.h>
+ #include <stdbool.h>
++#include <stdint.h>
++#include <sys/socket.h>
+ 
+ #define MAX_IFNAME_LEN	   256
+ #define MAX_HOSTNAME_LEN   256
+@@ -53,7 +55,8 @@
+ 	int conf_interval;
+ 	int conf_timeout;
+ 	char conf_hostname[MAX_HOSTNAME_LEN];
+-	int conf_host; /* resolved IP */
++	struct sockaddr_storage conf_host;
++	int conf_family;
+ 	enum protocol conf_proto;
+ 	int conf_tcp_port;
+ 	int conf_panic_timeout; /* minutes */
+@@ -65,6 +68,10 @@
+ 	struct uloop_timeout timeout_offline;
+ 	struct uloop_timeout timeout_send;
+ 	struct timespec time_sent;
++	bool active;
++	bool awaiting_reply;
++	uint8_t echo_cookie[16];
++	uint16_t echo_seq;
+ 
+ 	/* internal state for scripts */
+ 	struct scripts_proc scripts_on;
+@@ -75,12 +82,12 @@
+ long timespec_diff_ms(struct timespec start, struct timespec end);
+ 
+ // icmp.c
+-int icmp_init(const char* ifname);
+-bool icmp_echo_send(int fd, int dst, int cnt);
+-int icmp_echo_receive(int fd);
++int icmp_init(const char* ifname, int family);
++bool icmp_echo_send(struct ping_intf* pi);
++bool icmp_echo_receive(struct ping_intf* pi);
+ 
+ // tcp.c
+-int tcp_connect(const char* ifname, int dst, int port);
++int tcp_connect(const char* ifname, const struct sockaddr_storage* dst, int port);
+ bool tcp_check_connect(int fd);
+ 
+ // ping.c
+@@ -91,8 +98,7 @@
+ // ubus.c
+ bool ubus_init(void);
+ bool ubus_listen_network_events(void);
+-int ubus_interface_get_status(const char* name, char* device,
+-							  size_t device_len);
++int ubus_interface_get_status(const char* name, char* device, size_t device_len);
+ bool ubus_register_server(void);
+ void ubus_finish(void);
+ 
+--- a/ping.c
++++ b/ping.c
+@@ -24,10 +24,10 @@
+ 
+ static void ping_uloop_fd_close(struct uloop_fd* ufd)
+ {
+-	if (ufd != NULL && ufd->fd > 0) {
++	if (ufd != NULL && ufd->fd >= 0) {
+ 		uloop_fd_delete(ufd);
+ 		close(ufd->fd);
+-		ufd->fd = 0;
++		ufd->fd = -1;
+ 	}
+ }
+ 
+@@ -38,20 +38,8 @@
+ 	struct ping_intf* pi = container_of(fd, struct ping_intf, ufd);
+ 
+ 	if (pi->conf_proto == ICMP) {
+-		int received_fd = icmp_echo_receive(fd->fd);
+-		if (received_fd == -1) {
++		if (!icmp_echo_receive(pi))
+ 			return;
+-		} else {
+-			if (fd->fd != received_fd) {
+-				struct ping_intf* interface = get_interface_by_fd(received_fd);
+-				if (interface != NULL) {
+-					pi = container_of(&interface->ufd, struct ping_intf, ufd);
+-				} else {
+-					printf("ICMP echo received for different handle that was not found %d\n", received_fd);
+-					return;
+-				}
+-			}
+-		}
+ 	} else if (pi->conf_proto == TCP) {
+ 		/* with TCP, the handler is called when connect() succeds or fails.
+ 		 *
+@@ -66,11 +54,12 @@
+ 		bool succ = tcp_check_connect(fd->fd);
+ 		ping_uloop_fd_close(fd);
+ 		// printf("TCP connected %d\n", succ);
+-		if (!succ) {
++		if (!succ || !pi->awaiting_reply) {
+ 			return;
+ 		}
+ 	}
+ 
++	pi->awaiting_reply = false;
+ 	// LOG_DBG("Received pong on '%s'", pi->name);
+ 	pi->cnt_succ++;
+ 
+@@ -111,11 +100,8 @@
+ {
+ 	int ret;
+ 
+-	if (pi->ufd.fd != 0) {
+-		LOG_ERR("Ping on '%s' already init", pi->name);
++	if (pi->active)
+ 		return true;
+-	}
+-
+ 	if (!pi->conf_ignore_ubus) {
+ 		ret = ubus_interface_get_status(pi->name, pi->device, MAX_IFNAME_LEN);
+ 		if (ret < 0) {
+@@ -142,7 +128,7 @@
+ 
+ 	/* init ICMP socket. for TCP we open a new socket every time */
+ 	if (pi->conf_proto == ICMP) {
+-		ret = icmp_init(pi->device);
++		ret = icmp_init(pi->device, pi->conf_family);
+ 		if (ret < 0) {
+ 			return false;
+ 		}
+@@ -153,6 +139,7 @@
+ 		ret = uloop_fd_add(&pi->ufd, ULOOP_READ);
+ 		if (ret < 0) {
+ 			LOG_ERR("Could not add uloop fd %d for '%s'", pi->ufd.fd, pi->name);
++			ping_stop(pi);
+ 			return false;
+ 		}
+ 	}
+@@ -162,6 +149,7 @@
+ 	ret = uloop_timeout_set(&pi->timeout_send, 1000);
+ 	if (ret < 0) {
+ 		LOG_ERR("Could not add uloop send timeout for '%s'", pi->name);
++		ping_stop(pi);
+ 		return false;
+ 	}
+ 
+@@ -176,6 +164,7 @@
+ 							pi->conf_timeout * 1000 + 900);
+ 	if (ret < 0) {
+ 		LOG_ERR("Could not add uloop offline timeout for '%s'", pi->name);
++		ping_stop(pi);
+ 		return false;
+ 	}
+ 
+@@ -184,31 +173,21 @@
+ 	pi->cnt_succ = 0;
+ 	pi->last_rtt = 0;
+ 	pi->max_rtt = 0;
+-
++	pi->active = true;
++	state_change(UP, pi);
+ 	return true;
+ }
+ 
+ static bool ping_resolve(struct ping_intf* pi)
+ {
+-	struct addrinfo hints;
+-	struct addrinfo* addr;
+-
+-	memset(&hints, 0, sizeof(struct addrinfo));
+-	hints.ai_family = AF_INET;
++	struct addrinfo hints = {0}, *addr = NULL;
++	hints.ai_family = pi->conf_family;
+ 	hints.ai_socktype = pi->conf_proto == ICMP ? SOCK_DGRAM : SOCK_STREAM;
+-
+-	int r = getaddrinfo(pi->conf_hostname, NULL, &hints, &addr);
+-	if (r < 0 || addr == NULL) {
+-		LOG_ERR("Failed to resolve '%s'", pi->conf_hostname);
+-		return false;
+-	}
+-
+-	/* use only first address */
+-	struct sockaddr_in* sa = (struct sockaddr_in*)addr->ai_addr;
+-	printf("Resolved %s to %s\n", pi->conf_hostname,
+-		   inet_ntoa((struct in_addr)sa->sin_addr));
+-	pi->conf_host = sa->sin_addr.s_addr;
+-
++	int result = getaddrinfo(pi->conf_hostname, NULL, &hints, &addr);
++	if (result || !addr)
++		return false;
++	memset(&pi->conf_host, 0, sizeof(pi->conf_host));
++	memcpy(&pi->conf_host, addr->ai_addr, addr->ai_addrlen);
+ 	freeaddrinfo(addr);
+ 	return true;
+ }
+@@ -219,13 +198,13 @@
+  * checked in the uloop socket callback above */
+ static bool ping_send_tcp(struct ping_intf* pi)
+ {
+-	if (pi->ufd.fd > 0) {
++	if (pi->ufd.fd >= 0) {
+ 		// LOG_DBG("TCP connection timed out '%s'", pi->name);
+ 		ping_uloop_fd_close(&pi->ufd);
+ 	}
+ 
+-	int ret = tcp_connect(pi->device, pi->conf_host, pi->conf_tcp_port);
+-	if (ret > 0) {
++	int ret = tcp_connect(pi->device, &pi->conf_host, pi->conf_tcp_port);
++	if (ret >= 0) {
+ 		/* add socket handler to uloop.
+ 		 * when connect() finishes, select indicates writability */
+ 		pi->ufd.fd = ret;
+@@ -233,8 +212,11 @@
+ 		ret = uloop_fd_add(&pi->ufd, ULOOP_WRITE);
+ 		if (ret < 0) {
+ 			LOG_ERR("Could not add uloop fd %d for '%s'", pi->ufd.fd, pi->name);
+-			return false;
+-		}
++			ping_uloop_fd_close(&pi->ufd);
++			return false;
++		}
++	} else {
++		return false;
+ 	}
+ 	return true;
+ }
+@@ -242,9 +224,12 @@
+ bool ping_send(struct ping_intf* pi)
+ {
+ 	bool ret = false;
++	if (!pi->active)
++		return false;
++	pi->awaiting_reply = false;
+ 
+ 	/* resolve at least every 10th time */
+-	if (pi->conf_host == 0 || pi->state != ONLINE || pi->cnt_sent % 10 == 0) {
++	if (pi->conf_host.ss_family == 0 || pi->state != ONLINE || pi->cnt_sent % 10 == 0) {
+ 		if (!ping_resolve(pi)) {
+ 			return false;
+ 		}
+@@ -252,11 +237,11 @@
+ 
+ 	/* either send ICMP ping or start TCP connection */
+ 	if (pi->conf_proto == ICMP) {
+-		if (pi->ufd.fd <= 0) {
++		if (pi->ufd.fd < 0) {
+ 			LOG_ERR("ping not init on '%s'", pi->name);
+ 			return false;
+ 		}
+-		ret = icmp_echo_send(pi->ufd.fd, pi->conf_host, pi->cnt_sent);
++		ret = icmp_echo_send(pi);
+ 	} else if (pi->conf_proto == TCP) {
+ 		ret = ping_send_tcp(pi);
+ 	}
+@@ -264,6 +249,7 @@
+ 	/* common code */
+ 	if (ret) {
+ 		pi->cnt_sent++;
++		pi->awaiting_reply = true;
+ 		clock_gettime(CLOCK_MONOTONIC, &pi->time_sent);
+ 	} else {
+ 		LOG_ERR("Could not send ping on '%s'", pi->name);
+@@ -273,6 +259,9 @@
+ 
+ void ping_stop(struct ping_intf* pi)
+ {
++	pi->active = false;
++	pi->awaiting_reply = false;
++	memset(&pi->conf_host, 0, sizeof(pi->conf_host));
+ 	uloop_timeout_cancel(&pi->timeout_offline);
+ 	uloop_timeout_cancel(&pi->timeout_send);
+ 	ping_uloop_fd_close(&pi->ufd);
+--- a/tcp.c
++++ b/tcp.c
+@@ -26,56 +26,37 @@
+ #include <sys/socket.h>
+ #include <unistd.h>
+ 
+-int tcp_connect(const char* ifname, int dst, int port)
++int tcp_connect(const char* ifname, const struct sockaddr_storage* dst, int port)
+ {
+-	int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+-	if (fd == -1) {
+-		warn("Could not open TCP socket");
++	int fd = socket(dst->ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
++					IPPROTO_TCP);
++	if (fd < 0)
+ 		return -1;
++
++	if (!ifname || !*ifname || strlen(ifname) >= IFNAMSIZ ||
++		setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname) + 1))
++		goto fail;
++
++	struct sockaddr_storage addr = *dst;
++	socklen_t len;
++	if (addr.ss_family == AF_INET6) {
++		((struct sockaddr_in6*)&addr)->sin6_port = htons(port);
++		len = sizeof(struct sockaddr_in6);
++	} else {
++		((struct sockaddr_in*)&addr)->sin_port = htons(port);
++		len = sizeof(struct sockaddr_in);
+ 	}
+-
+-	/* bind to interface */
+-	if (ifname != NULL) {
+-		if (strlen(ifname) >= IFNAMSIZ) {
+-			fprintf(stderr, "TCP: ifname too long");
+-			return -1;
+-		}
+-		struct ifreq ifr;
+-		strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+-		int ret
+-			= setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr));
+-		if (ret < 0) {
+-			warn("TCP: could not bind to '%s'", ifname);
+-			close(fd);
+-			return -1;
+-		}
+-	}
+-
+-	/* make non-blocking */
+-	unsigned int fl = fcntl(fd, F_GETFL, 0);
+-	fl |= O_NONBLOCK;
+-	fcntl(fd, F_SETFL, fl);
+-
+-	/* connect */
+-	struct sockaddr_in addr;
+-	memset(&addr, 0, sizeof(addr));
+-	addr.sin_family = AF_INET;
+-	addr.sin_port = htons(port);
+-	addr.sin_addr.s_addr = dst;
+-
+-	int ret = connect(fd, (struct sockaddr*)&addr, sizeof(struct sockaddr_in));
+-	if (ret == -1 && errno != EINPROGRESS) {
+-		warn("TCP: could not connect");
+-		return -1;
+-	}
+-
++	if (connect(fd, (struct sockaddr*)&addr, len) && errno != EINPROGRESS)
++		goto fail;
+ 	return fd;
++fail:
++	close(fd);
++	return -1;
+ }
+ 
+ bool tcp_check_connect(int fd)
+ {
+-	int err;
+-	socklen_t len = sizeof(err);
+-	getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+-	return err == 0;
++	int error = 0;
++	socklen_t len = sizeof(error);
++	return !getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) && !error;
+ }
+--- a/uci.c
++++ b/uci.c
+@@ -93,6 +93,8 @@
+ 				continue;
+ 			}
+ 			strcpy(intf[idx].name, str);
++			intf[idx].conf_family = AF_INET;
++			intf[idx].ufd.fd = -1;
+ 
+ 			val = uci_lookup_option_int(uci, s, "interval");
+ 			intf[idx].conf_interval = val > 0 ? val : default_interval;
