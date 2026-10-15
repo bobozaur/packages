@@ -16,7 +16,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=wifischedule
 PKG_VERSION:=1.1.0
-PKG_RELEASE:=0
+PKG_RELEASE:=1
 PKG_LICENSE:=PRPL
 
 PKG_MAINTAINER:=Nils Koenig <openwrt@newk.it> 
@@ -51,6 +51,8 @@ endef
 define Package/wifischedule/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) ./net/usr/bin/wifi_schedule.sh $(1)/usr/bin/wifi_schedule.sh
+	$(INSTALL_DIR) $(1)/usr/share/wifischedule
+	$(INSTALL_DATA) ./net/usr/share/wifischedule/time.sh $(1)/usr/share/wifischedule/time.sh
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_DATA) ./net/etc/config/wifi_schedule $(1)/etc/config/wifi_schedule
 	$(INSTALL_DIR) $(1)/etc/init.d
@@ -60,7 +62,7 @@ endef
 define Package/wifischedule/postinst
 #!/bin/sh
 # check if we are on real system
-if [ -z "$${IPKG_INSTROOT}" ]; then
+if [ -z "$${IPKG_INSTROOT}" ] && [ "$${PKG_UPGRADE}" != 1 ]; then
 	echo "Enabling rc.d symlink for wifischedule"
 	/etc/init.d/wifi_schedule enable
 fi
