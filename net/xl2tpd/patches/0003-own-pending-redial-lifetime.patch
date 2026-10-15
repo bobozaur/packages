@@ -1,0 +1,56 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] xl2tpd: cancel pending redial with its LAC owner
+
+Retire the scheduled callback before a LAC is replaced or disconnected so it
+cannot run against a freed or newly assigned owner.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/xl2tpd.c
++++ b/xl2tpd.c
+@@ -814,6 +814,14 @@
+     return NULL;
+ }
+ 
++/* A LAC owns its redial event until it runs or an explicit operation replaces
++ * it.  process_schedule() unlinks a running event before invoking us. */
++static void lac_cancel_redial (struct lac *lac)
++{
++    deschedule (lac->rsched);
++    lac->rsched = NULL;
++}
++
+ void magic_lac_dial (void *data)
+ {
+     struct lac *lac;
+@@ -823,12 +831,12 @@
+         l2tp_log (LOG_WARNING, "%s : called on NULL lac!\n", __FUNCTION__);
+         return;
+     }
++    lac_cancel_redial (lac);
+     if (!lac->active)
+     {
+         l2tp_log (LOG_DEBUG, "%s: LAC %s not active", __FUNCTION__, lac->entname);
+         return;
+     }
+-    lac->rsched = NULL;
+     lac->rtries++;
+     if (lac->rmax && (lac->rtries > lac->rmax))
+     {
+@@ -1387,6 +1395,7 @@
+         if (!strcasecmp (lac->entname, tunstr))
+         {
+             lac->active = 0;
++            lac_cancel_redial (lac);
+             lac->rtries = 0;
+             if (lac->t)
+             {
+@@ -1506,6 +1515,7 @@
+     }
+     // disconnect lac
+     lac->active = 0;
++    lac_cancel_redial (lac);
+     lac->rtries = 0;
+     if (lac->t)
+     {
