@@ -8,7 +8,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=pingcheck
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/br101/pingcheck
@@ -51,6 +51,8 @@ define Package/pingcheck/install
 	$(INSTALL_BIN) ./pingcheck.init $(1)/etc/init.d/pingcheck
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/pingcheck.config $(1)/etc/config/pingcheck
+	$(INSTALL_DIR) $(1)/usr/share/pingcheck
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/pingcheck.config $(1)/usr/share/pingcheck/default.config
 	$(INSTALL_DIR) $(1)/etc/pingcheck/online.d/
 	$(INSTALL_DIR) $(1)/etc/pingcheck/offline.d/
 	$(INSTALL_DIR) $(1)/etc/pingcheck/panic.d/
