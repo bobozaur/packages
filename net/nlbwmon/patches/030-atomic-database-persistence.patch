@@ -1,0 +1,739 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] Publish accounting snapshots atomically and merge only validated data
+
+Validate complete input and reserve merge capacity before changing live
+counters. Publish a synced temporary inode by same-directory rename and
+report directory-sync failure independently of publication. Preserve an
+existing period encoding and defer shutdown saves to the native event loop.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/database.c
++++ b/database.c
+@@ -22,6 +22,7 @@
+ #include <stdlib.h>
+ #include <errno.h>
+ #include <fcntl.h>
++#include <limits.h>
+ #include <dirent.h>
+ #include <unistd.h>
+ #include <string.h>
+@@ -100,7 +101,11 @@
+ 	else if (limit > 0 && limit < size)
+ 		size = limit;
+ 
+-	len = sizeof(struct database) + size * sizeof(struct record);
++	if (size > (SIZE_MAX - sizeof(struct database)) / sizeof(struct record)) {
++		errno = EOVERFLOW;
++		return NULL;
++	}
++	len = sizeof(struct database) + (size_t)size * sizeof(struct record);
+ 	h = calloc(1, sizeof(*h));
+ 
+ 	if (!h)
+@@ -127,16 +132,20 @@
+ database_grow(struct dbhandle *h)
+ {
+ 	struct database *tmp;
+-	uint32_t size;
++	uint64_t size;
+ 	size_t len;
+ 
+-	size = h->size + (h->size >> 1);
++	size = (uint64_t)h->size + (h->size >> 1);
+ 
+ 	if (h->limit > 0 && size > h->limit)
+ 		size = h->limit;
+ 
+ 	if (size <= h->size)
+ 		return -ENOSPC;
++
++	if (size > UINT32_MAX ||
++	    size > (SIZE_MAX - sizeof(*h->db)) / sizeof(h->db->records[0]))
++		return -EOVERFLOW;
+ 
+ 	len = sizeof(*h->db) + size * sizeof(h->db->records[0]);
+ 	tmp = realloc(h->db, len);
+@@ -294,270 +303,307 @@
+ 	return -EINVAL;
+ }
+ 
+-static int
+-database_save_gzip(struct dbhandle *h, const char *path, uint32_t timestamp)
+-{
+-	struct record *src;
+-	gzFile gz = NULL;
+-	int i, fd;
+-
+-	fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0640);
+-
++/* The caller retains fd for fsync after the encoder has flushed and closed. */
++static int
++database_save_gzip(struct dbhandle *h, int fd)
++{
++	gzFile gz;
++	int i, out, err = 0, zerr, close_err;
++
++	out = dup(fd);
++	if (out < 0)
++		return -errno;
++	gz = gzdopen(out, "wb9");
++	if (!gz) {
++		close(out);
++		return -ENOMEM;
++	}
++
++	if (gzwrite(gz, h->db, sizeof(*h->db)) != sizeof(*h->db))
++		goto error;
++	for (i = 0; i < db_entries(h->db); i++)
++		if (gzwrite(gz, &h->db->records[i], db_recsize) != db_recsize)
++			goto error;
++	goto out;
++
++error:
++	gzerror(gz, &zerr);
++	err = zerr == Z_ERRNO ? -errno : -EIO;
++out:
++	close_err = database_gzclose(gz);
++	return err ? err : close_err;
++}
++
++static int
++database_save_plain(struct dbhandle *h, int fd)
++{
++	FILE *fp;
++	int i, out, err = 0;
++
++	out = dup(fd);
++	if (out < 0)
++		return -errno;
++	fp = fdopen(out, "wb");
++	if (!fp) {
++		err = -errno;
++		close(out);
++		return err;
++	}
++
++	/* Buffered writes report ENOSPC instead of faulting in a mapped file. */
++	if (fwrite(h->db, sizeof(*h->db), 1, fp) != 1)
++		err = -errno;
++	for (i = 0; !err && i < db_entries(h->db); i++)
++		if (fwrite(&h->db->records[i], db_recsize, 1, fp) != 1)
++			err = -errno;
++	if (fclose(fp) && !err)
++		err = -errno;
++	return err;
++}
++
++/* Keep a period's existing encoding. A compression preference applies to new
++ * periods; changing names would require publishing and retiring two files. */
++static int
++database_path(const char *path, uint32_t timestamp, char *file, size_t len,
++              bool *compress)
++{
++	struct stat s;
++	int i;
++
++	for (i = 1; i >= 0; i--) {
++		if (snprintf(file, len, "%s/%u.db%s", path, timestamp,
++		             i ? ".gz" : "") >= len)
++			return -ENAMETOOLONG;
++		if (!stat(file, &s)) {
++			*compress = i;
++			return 1;
++		}
++		if (errno != ENOENT)
++			return -errno;
++	}
++	if (snprintf(file, len, "%s/%u.db%s", path, timestamp,
++	             *compress ? ".gz" : "") >= len)
++		return -ENAMETOOLONG;
++	return 0;
++}
++
++int
++database_save(struct dbhandle *h, const char *path, uint32_t timestamp,
++              bool compress)
++{
++	uint32_t old_timestamp;
++	char file[PATH_MAX], temp[PATH_MAX], alternate[PATH_MAX];
++	int fd = -1, dirfd, err, exists;
++
++	exists = database_path(path, timestamp, file, sizeof(file), &compress);
++	if (exists < 0)
++		return exists;
++	/* A late-mounted database must be merged before publishing live values. */
++	if (h->pristine && timestamp > 0 && exists)
++		return -EEXIST;
++	if (snprintf(temp, sizeof(temp), "%s/.nlbwmon.XXXXXX", path) >= sizeof(temp) ||
++	    snprintf(alternate, sizeof(alternate), "%s/%u.db%s", path, timestamp,
++	             compress ? "" : ".gz") >= sizeof(alternate))
++		return -ENAMETOOLONG;
++
++	dirfd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++	if (dirfd < 0)
++		return -errno;
++	fd = mkstemp(temp);
++	if (fd < 0) {
++		err = -errno;
++		close(dirfd);
++		return err;
++	}
++	if (fchmod(fd, 0640)) {
++		err = -errno;
++		goto out;
++	}
++
++	old_timestamp = h->db->timestamp;
++	h->db->timestamp = htobe32(timestamp);
++	err = compress ? database_save_gzip(h, fd) : database_save_plain(h, fd);
++	h->db->timestamp = old_timestamp;
++	if (!err && fsync(fd))
++		err = -errno;
++	if (close(fd) && !err)
++		err = -errno;
++	fd = -1;
++	if (err)
++		goto out;
++	if (rename(temp, file)) {
++		err = -errno;
++		goto out;
++	}
++
++	/* Publication, not attempted I/O, ends pristine state. Even a later sync
++	 * error must not make a retry merge our own published counters again. */
++	if (timestamp > 0)
++		h->pristine = false;
++	if (unlink(alternate) && errno != ENOENT)
++		err = -errno;
++	if (fsync(dirfd) && !err)
++		err = -errno;
++out:
++	if (fd >= 0)
++		close(fd);
++	unlink(temp);
++	close(dirfd);
++	return err;
++}
++
++static int
++database_restore_gzip(struct dbhandle *h, const char *path, uint32_t timestamp)
++{
++	struct database hdr;
++	struct record rec;
++	uint32_t entries, i;
++	gzFile gz;
++	int err = 0, zerr;
++
++	gz = gzopen(path, "rb");
++	if (!gz)
++		return -errno;
++	if (gzread(gz, &hdr, sizeof(hdr)) != sizeof(hdr)) {
++		err = -ERANGE;
++		goto out;
++	}
++	if (be32toh(hdr.magic) != MAGIC || hdr.interval.type == 0 ||
++	    db_timestamp(&hdr) != timestamp) {
++		err = -EINVAL;
++		goto out;
++	}
++
++	entries = db_entries(&hdr);
++	/* Even with a smaller configured limit, consume and validate the whole
++	 * archive. Only the selected records need storage in the staged handle. */
++	for (i = 0; i < entries; i++) {
++		if (gzread(gz, &rec, db_recsize) != db_recsize) {
++			err = -ERANGE;
++			goto out;
++		}
++		if (h && (!h->limit || i < h->limit)) {
++			err = database_insert(h, &rec);
++			if (err)
++				goto out;
++		}
++	}
++	if (gzgetc(gz) != -1) {
++		err = -ERANGE;
++		goto out;
++	}
++	gzerror(gz, &zerr);
++	if (zerr != Z_OK || !gzeof(gz)) {
++		err = zerr == Z_ERRNO ? -errno : -EIO;
++		goto out;
++	}
++	if (h)
++		h->pristine = false;
++out:
++	zerr = database_gzclose(gz);
++	return err ? err : zerr;
++}
++
++static int
++database_restore_mmap(struct dbhandle *h, const char *path, uint32_t timestamp,
++                      size_t filesize)
++{
++	struct database *db = MAP_FAILED;
++	uint32_t entries, i;
++	int fd = -1, err = 0;
++	size_t len = filesize;
++
++	if (filesize < sizeof(struct database))
++		return -ERANGE;
++	if (h && h->limit > 0 &&
++	    h->limit < (filesize - sizeof(struct database)) / db_recsize)
++		len = sizeof(struct database) + (size_t)h->limit * db_recsize;
++
++	fd = open(path, O_RDONLY);
+ 	if (fd < 0)
+ 		return -errno;
+-
+-	gz = gzdopen(fd, "wb9");
+-
+-	if (!gz) {
+-		close(fd);
+-		return -ENOMEM;
+-	}
+-
+-	if (gzwrite(gz, h->db, sizeof(*h->db)) != sizeof(*h->db))
+-		goto out;
+-
+-	for (i = 0; i < db_entries(h->db); i++) {
+-		src = &h->db->records[i];
+-
+-		if (gzwrite(gz, src, db_recsize) != db_recsize)
++	db = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
++	if (db == MAP_FAILED) {
++		err = -errno;
++		goto out;
++	}
++
++	entries = db_entries(db);
++	if (be32toh(db->magic) != MAGIC || db->interval.type == 0 ||
++	    db_timestamp(db) != timestamp) {
++		err = -EINVAL;
++		goto out;
++	}
++	if (entries > (filesize - sizeof(*db)) / db_recsize) {
++		err = -ERANGE;
++		goto out;
++	}
++	if (!h)
++		goto out;
++	if (h->limit > 0 && h->limit < entries)
++		entries = h->limit;
++
++	for (i = 0; i < entries; i++) {
++		err = database_insert(h, db_diskrecord(db, i));
++		if (err)
+ 			goto out;
+ 	}
+-
+-	errno = 0;
+-
+-out:
+-	if (gz)
+-		errno = -database_gzclose(gz);
+-
+-	return -errno;
+-}
+-
+-static int
+-database_save_mmap(struct dbhandle *h, const char *path, uint32_t timestamp)
+-{
+-	struct database *db = MAP_FAILED;
+-	struct record *src, *dst;
+-	int i = 0, o = 0, fd;
+-	size_t len;
+-
+-	len = db_disksize(h->db);
+-	fd = open(path, O_CREAT|O_RDWR, 0640);
+-
+-	if (fd < 0)
+-		goto out;
+-
+-	if (ftruncate(fd, len))
+-		goto out;
+-
+-	db = mmap(NULL, len, PROT_WRITE, MAP_SHARED, fd, 0);
+-
+-	if (db == MAP_FAILED)
+-		goto out;
+-
+-	memcpy(db, h->db, sizeof(*db));
+-
+-	for (i = 0; i < db_entries(h->db); i++) {
+-		src = &h->db->records[i];
+-		dst = db_diskrecord(db, o++);
+-		memcpy(dst, src, db_recsize);
+-	}
+-
+-	errno = 0;
+-
++	h->pristine = false;
+ out:
+ 	if (db != MAP_FAILED)
+ 		munmap(db, len);
+-
+-	if (fd >= 0)
+-		close(fd);
+-
+-	return -errno;
+-}
+-
+-int
+-database_save(struct dbhandle *h, const char *path, uint32_t timestamp,
+-              bool compress)
+-{
+-	uint32_t old_timestamp;
+-	char file[256];
+-	struct stat s;
+-	int err;
+-
+-	snprintf(file, sizeof(file), "%s/%u.db%s",
+-	         path, timestamp, compress ? ".gz" : "");
+-
+-	/* If the database is pristine (was not read from disk), there must
+-	 * not be an existing database file already. If there is a file now
+-	 * which was not present when setting up the database, we're likely
+-	 * dealing with a storage location that only became available after
+-	 * nlbwmon started.
+-	 *
+-	 * Return -EEXIST to the caller in such a case to allow it to take
+-	 * appropriate actions, such as emitting a warning or merging the
+-	 * on-disk data.
+-	 */
+-	if (h->pristine && timestamp > 0 && stat(file, &s) == 0)
+-		return -EEXIST;
+-
+-	old_timestamp = h->db->timestamp;
+-	h->db->timestamp = htobe32(timestamp);
+-
+-	if (compress)
+-		err = database_save_gzip(h, file, timestamp);
+-	else
+-		err = database_save_mmap(h, file, timestamp);
+-
+-	if (err)
+-		unlink(file);
+-
+-	if (timestamp > 0)
+-		h->pristine = false;
+-
+-	h->db->timestamp = old_timestamp;
+-
++	close(fd);
+ 	return err;
+-}
+-
+-static int
+-database_restore_gzip(struct dbhandle *h, const char *path, uint32_t timestamp)
+-{
+-	struct database hdr;
+-	struct record rec;
+-	uint32_t entries;
+-	gzFile gz;
+-	int i;
+-
+-	gz = gzopen(path, "rb");
+-
+-	if (!gz)
+-		return -errno;
+-
+-	if (gzread(gz, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+-		database_gzclose(gz);
+-		return -ERANGE;
+-	}
+-
+-	entries = db_entries(&hdr);
+-
+-	if (h && h->limit > 0 && h->limit < entries)
+-		entries = h->limit;
+-
+-	if (be32toh(hdr.magic) != MAGIC) {
+-		database_gzclose(gz);
+-		return -EINVAL;
+-	}
+-
+-	if (hdr.interval.type == 0 || db_timestamp(&hdr) != timestamp) {
+-		database_gzclose(gz);
+-		return -EINVAL;
+-	}
+-
+-	if (h) {
+-		h->pristine = false;
+-
+-		for (i = 0; i < entries; i++) {
+-			if (gzread(gz, &rec, db_recsize) != db_recsize) {
+-				database_gzclose(gz);
+-				return -ERANGE;
+-			}
+-
+-			database_insert(h, &rec);
+-		}
+-
+-		if (gzgetc(gz) != -1) {
+-			database_gzclose(gz);
+-			return -ERANGE;
+-		}
+-	}
+-
+-	return database_gzclose(gz);
+-}
+-
+-static int
+-database_restore_mmap(struct dbhandle *h, const char *path, uint32_t timestamp,
+-                      size_t filesize)
+-{
+-	struct database *db = MAP_FAILED;
+-	int i, entries, fd = -1;
+-	size_t len = filesize;
+-
+-	if (filesize < sizeof(struct database))
+-		return -ERANGE;
+-
+-	if (h && h->limit > 0)
+-		len = sizeof(struct database) + h->limit * db_recsize;
+-
+-	if (len > filesize)
+-		len = filesize;
+-
+-	fd = open(path, O_RDONLY);
+-
+-	if (fd < 0)
+-		goto out;
+-
+-	db = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+-
+-	if (db == MAP_FAILED)
+-		goto out;
+-
+-	entries = db_entries(db);
+-
+-	if (h && h->limit > 0 && h->limit < entries)
+-		entries = h->limit;
+-
+-	if (be32toh(db->magic) != MAGIC) {
+-		errno = EINVAL;
+-		goto out;
+-	}
+-
+-	if (db->interval.type == 0 || db_timestamp(db) != timestamp) {
+-		errno = EINVAL;
+-		goto out;
+-	}
+-
+-	if (!h) {
+-		errno = 0;
+-		goto out;
+-	}
+-
+-	if (sizeof(*db) + entries * db_recsize > len) {
+-		errno = ERANGE;
+-		goto out;
+-	}
+-
+-	errno = 0;
+-	h->pristine = false;
+-
+-	for (i = 0; i < entries; i++)
+-		database_insert(h, db_diskrecord(db, i));
+-
+-out:
+-	if (db != MAP_FAILED)
+-		munmap(db, len);
+-
+-	if (fd >= 0)
+-		close(fd);
+-
+-	return -errno;
+ }
+ 
+ int
+ database_load(struct dbhandle *h, const char *path, uint32_t timestamp)
+ {
+-	char name[256];
++	struct dbhandle *staged = NULL;
++	char name[PATH_MAX];
+ 	struct stat s;
+-
+-	snprintf(name, sizeof(name), "%s/%u.db.gz", path, timestamp);
+-
+-	if (!stat(name, &s))
+-		return database_restore_gzip(h, name, timestamp);
+-
+-	snprintf(name, sizeof(name), "%s/%u.db", path, timestamp);
+-
+-	if (!stat(name, &s))
+-		return database_restore_mmap(h, name, timestamp, s.st_size);
+-
+-	return -errno;
++	uint64_t capacity;
++	uint32_t i;
++	bool compress = false;
++	int err;
++
++	err = database_path(path, timestamp, name, sizeof(name), &compress);
++	if (err <= 0)
++		return err ? err : -ENOENT;
++	if (stat(name, &s))
++		return -errno;
++	if (h) {
++		staged = database_init(&h->db->interval, false, h->limit);
++		if (!staged)
++			return -ENOMEM;
++	}
++	err = compress ? database_restore_gzip(staged, name, timestamp) :
++	                 database_restore_mmap(staged, name, timestamp, s.st_size);
++	if (err || !h)
++		goto out;
++
++	/* Parse completely and reserve before merging. Neither a corrupt file
++	 * nor allocation failure may partially add counters on repeated loads. */
++	capacity = (uint64_t)db_entries(h->db) + db_entries(staged->db);
++	if (h->limit && capacity > h->limit)
++		capacity = h->limit;
++	if (capacity > UINT32_MAX ||
++	    capacity > (SIZE_MAX - sizeof(*h->db)) / sizeof(h->db->records[0])) {
++		err = -EOVERFLOW;
++		goto out;
++	}
++	while (h->size < capacity) {
++		err = database_grow(h);
++		if (err)
++			goto out;
++	}
++	for (i = 0; i < db_entries(staged->db); i++)
++		database_insert(h, &staged->db->records[i]);
++	h->pristine = false;
++out:
++	if (staged)
++		database_free(staged);
++	return err;
+ }
+ 
+ int
+--- a/nlbwmon.c
++++ b/nlbwmon.c
+@@ -81,7 +81,7 @@
+ };
+ 
+ 
+-static void save_persistent(uint32_t timestamp)
++static int save_persistent(uint32_t timestamp)
+ {
+ 	int err;
+ 
+@@ -95,34 +95,50 @@
+ 		if (err) {
+ 			fprintf(stderr, "Unable to load existing database: %s\n",
+ 			        strerror(-err));
++			return err;
+ 		}
+-	}
+-
+-	err = database_save(gdbh, opt.db.directory, timestamp, opt.db.compress);
++		err = database_save(gdbh, opt.db.directory, timestamp, opt.db.compress);
++	}
+ 
+ 	if (err) {
+ 		fprintf(stderr, "Unable to save database: %s\n",
+ 		        strerror(-err));
+ 	}
+-}
+-
+-static void handle_shutdown(int sig)
++	return err;
++}
++
++static int shutdown_signal;
++
++static void request_shutdown(struct uloop_signal *signal)
++{
++	if (!shutdown_signal)
++		shutdown_signal = signal->signo;
++	uloop_end();
++}
++
++static int handle_shutdown(int sig)
+ {
+ 	char path[256];
+ 	uint32_t timestamp = interval_timestamp(&opt.archive_interval, 0);
+-
+-	save_persistent(timestamp);
+-
+-	if (sig == SIGTERM) {
++	int err, temp_err;
++
++	err = save_persistent(timestamp);
++
++	if (sig == SIGTERM && !err) {
+ 		snprintf(path, sizeof(path), "%s/0.db", opt.tempdir);
+ 		unlink(path);
+ 	}
+ 	else {
+-		database_save(gdbh, opt.tempdir, 0, false);
+-	}
+-
+-	uloop_done();
+-	exit(0);
++		temp_err = database_save(gdbh, opt.tempdir, 0, false);
++		if (temp_err) {
++			fprintf(stderr, "Unable to save recovery database: %s\n",
++			        strerror(-temp_err));
++			if (!err)
++				err = temp_err;
++		}
++	}
++
++	return err ? 1 : 0;
+ }
+ 
+ static void
+@@ -210,9 +226,13 @@
+ static int
+ server_main(int argc, char **argv)
+ {
+-	struct sigaction sa = { .sa_handler = handle_shutdown };
++	struct uloop_signal signals[] = {
++		{ .cb = request_shutdown, .signo = SIGINT },
++		{ .cb = request_shutdown, .signo = SIGTERM },
++		{ .cb = request_shutdown, .signo = SIGUSR1 },
++	};
+ 	uint32_t timestamp;
+-	int optchr, err;
++	int optchr, err, i;
+ 	char *e;
+ 
+ 	while ((optchr = getopt(argc, argv, "b:i:r:s:o:p:G:I:L:PZ")) > -1) {
+@@ -358,10 +378,13 @@
+ 		exit(1);
+ 	}
+ 
+-	sigemptyset(&sa.sa_mask);
+-	sigaction(SIGINT, &sa, NULL);
+-	sigaction(SIGTERM, &sa, NULL);
+-	sigaction(SIGUSR1, &sa, NULL);
++	for (i = 0; i < ARRAY_SIZE(signals); i++) {
++		if (uloop_signal_add(&signals[i])) {
++			fprintf(stderr, "Unable to register shutdown signal: %s\n",
++			        strerror(errno));
++			return 1;
++		}
++	}
+ 
+ 	commit_tm.cb = handle_commit;
+ 	uloop_timer_set(&commit_tm, opt.commit_interval * 1000);
+@@ -371,7 +394,11 @@
+ 
+ 	uloop_run();
+ 
+-	return 0;
++	/* File I/O and allocation must not reenter a periodic save from a raw
++	 * signal handler. Finish the active callback before shutdown commits. */
++	err = shutdown_signal ? handle_shutdown(shutdown_signal) : 0;
++	uloop_done();
++	return err;
+ }
+ 
+ int
