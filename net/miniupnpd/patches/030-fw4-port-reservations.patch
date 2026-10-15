@@ -1,0 +1,487 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] nftables: serialize port allocations with fw4 reservations
+
+Coordinate OpenWrt timed port triggers and native UPnP/NAT-PMP/PCP mappings
+through the existing fw4 lock and one bounded reservation snapshot. Treat
+a missing reservation set as ordinary firewall4 compatibility; reject an
+incomplete or malformed set rather than allocate a conflicting mapping.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/commonrdr.h
++++ b/commonrdr.h
+@@ -12,6 +12,26 @@
+  */
+ 
+ #include "config.h"
++
++/* A request holds the fw4 configuration lock from its reservation snapshot
++ * through mapping publication. Begin/end may nest within one daemon request.
++ * Only startup lease restoration may wait; event-loop requests fail if busy.
++ * A successful begin permits O(1) reserved-port lookup until the matching end.
++ * The OpenWrt producer owns inet fw4 port_trigger_ports and /var/run/fw4.lock.
++ * Set keys concatenate ifname, inet_proto and inet_service; nftables pads each
++ * component to a 32-bit register boundary, with network-order protocol/port.
++ * An absent set is ordinary fw4 compatibility; invalid/incomplete dumps fail.
++ */
++#ifdef USE_NFTABLES
++int port_mapping_begin(const char *ifname, int wait);
++void port_mapping_end(void);
++int port_mapping_reserved(unsigned short port, int proto);
++#else
++static inline int port_mapping_begin(const char *ifname, int wait) { (void)ifname; (void)wait; return 0; }
++static inline void port_mapping_end(void) {}
++static inline int port_mapping_reserved(unsigned short port, int proto)
++{ (void)port; (void)proto; return 0; }
++#endif
+ 
+ /* init and shutdown functions */
+ 
+--- a/natpmp.c
++++ b/natpmp.c
+@@ -333,6 +333,8 @@
+ 				unsigned short eport_first = 0;
+ 				int any_eport_allowed = 0;
+ 				char desc[64];
++				int transaction = port_mapping_begin(ext_if_name, 0);
++				if (transaction < 0) resp[3] = 3;
+ 				if(eport==0)	/* if no suggested external port, use same a internal port */
+ 					eport = iport;
+ 				while(resp[3] == 0) {
+@@ -353,6 +355,11 @@
+ 					if(!check_upnp_rule_against_permissions(upnppermlist, num_upnpperm, eport, senderaddr->sin_addr, iport, "NAT-PMP")) {
+ 						eport++;
+ 						if(eport == 0) eport++; /* skip port zero */
++						continue;
++					}
++					if (port_mapping_reserved(eport, proto)) {
++						eport++;
++						if (eport == 0) eport++;
+ 						continue;
+ 					}
+ 					any_eport_allowed = 1;	/* at lease one eport is allowed */
+@@ -400,6 +407,7 @@
+ 					}
+ 					break;
+ 				}
++				if (transaction >= 0) port_mapping_end();
+ 			}
+ 			WRITENU16(resp+8, iport);	/* private port */
+ 			WRITENU16(resp+10, eport);	/* public port */
+--- a/netfilter_nft/nftnlrdr_misc.c
++++ b/netfilter_nft/nftnlrdr_misc.c
+@@ -26,6 +26,10 @@
+ #include <sys/socket.h>
+ #include <sys/queue.h>
+ #include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/file.h>
++#include <libnftnl/set.h>
+ 
+ #include <linux/netfilter.h>
+ #include <linux/netfilter/nfnetlink.h>
+@@ -93,6 +97,225 @@
+ static uint32_t rule_list_redirect_validate = RULE_CACHE_INVALID;
+ static uint32_t rule_list_peer_validate = RULE_CACHE_INVALID;
+ 
++
++/* fw4 publishes this interval set in the same transaction as trigger rules.
++ * Hold its lock through allocation/renewal, using one snapshot for all alternate
++ * port candidates. Nested redirect helpers reuse the outer transaction.
++ */
++static unsigned int mapping_depth;
++static int mapping_lock = -1;
++static unsigned char trigger_reserved[2][65536 / 8];
++
++static int
++reservation_elem_cb(struct nftnl_set_elem *elem, void *data)
++{
++	const char *ifname = data;
++	const unsigned char *key, *end;
++	uint32_t len, endlen;
++	unsigned int first, last, port, protocol;
++
++	key = nftnl_set_elem_get(elem, NFTNL_SET_ELEM_KEY, &len);
++	if (!key || len != IFNAMSIZ + 8 ||
++	    (nftnl_set_elem_is_set(elem, NFTNL_SET_ELEM_FLAGS) &&
++	     (nftnl_set_elem_get_u32(elem, NFTNL_SET_ELEM_FLAGS) & NFT_SET_ELEM_INTERVAL_END))) {
++		errno = EPROTO;
++		return -1;
++	}
++	end = nftnl_set_elem_get(elem, NFTNL_SET_ELEM_KEY_END, &endlen);
++	if (!end) {
++		end = key;
++		endlen = len;
++	}
++	if (endlen != len || memcmp(key, end, IFNAMSIZ + 4)) {
++		errno = EPROTO;
++		return -1;
++	}
++	if (strncmp((const char *)key, ifname, IFNAMSIZ) != 0)
++		return 0;
++	if (key[IFNAMSIZ] == IPPROTO_TCP)
++		protocol = 0;
++	else if (key[IFNAMSIZ] == IPPROTO_UDP)
++		protocol = 1;
++	else {
++		errno = EPROTO;
++		return -1;
++	}
++	first = (key[IFNAMSIZ + 4] << 8) | key[IFNAMSIZ + 5];
++	last = (end[IFNAMSIZ + 4] << 8) | end[IFNAMSIZ + 5];
++	if (last < first) {
++		errno = EPROTO;
++		return -1;
++	}
++	for (port = first; port <= last; port++)
++		trigger_reserved[protocol][port / 8] |= 1U << (port % 8);
++	return 0;
++}
++
++struct reservation_snapshot {
++	const char *ifname;
++	int complete;
++	int missing;
++};
++
++static int
++reservation_done_cb(const struct nlmsghdr *nlh, void *data)
++{
++	struct reservation_snapshot *snapshot = data;
++	int status;
++
++	if (mnl_nlmsg_get_payload_len(nlh) < sizeof(status)) {
++		errno = EPROTO;
++		return MNL_CB_ERROR;
++	}
++	memcpy(&status, mnl_nlmsg_get_payload(nlh), sizeof(status));
++	if (status) {
++		errno = status < 0 ? -status : EPROTO;
++		return MNL_CB_ERROR;
++	}
++	snapshot->complete = 1;
++	return MNL_CB_STOP;
++}
++
++static int
++reservation_error_cb(const struct nlmsghdr *nlh, void *data)
++{
++	struct reservation_snapshot *snapshot = data;
++	const struct nlmsgerr *error;
++
++	if (mnl_nlmsg_get_payload_len(nlh) < sizeof(*error)) {
++		errno = EPROTO;
++		return MNL_CB_ERROR;
++	}
++	error = mnl_nlmsg_get_payload(nlh);
++	if (!error->error)
++		return MNL_CB_OK;
++	snapshot->missing = error->error == -ENOENT;
++	errno = error->error < 0 ? -error->error : EPROTO;
++	return MNL_CB_ERROR;
++}
++
++static int
++reservation_dump_cb(const struct nlmsghdr *nlh, void *data)
++{
++	struct nftnl_set *set = nftnl_set_alloc();
++	int ret;
++
++	if (!set)
++		return MNL_CB_ERROR;
++	ret = nftnl_set_elems_nlmsg_parse(nlh, set);
++	if (ret >= 0)
++		ret = nftnl_set_elem_foreach(set, reservation_elem_cb,
++					   (void *)((struct reservation_snapshot *)data)->ifname);
++	nftnl_set_free(set);
++	return ret < 0 ? MNL_CB_ERROR : MNL_CB_OK;
++}
++
++static int
++snapshot_trigger_reservations(const char *ifname)
++{
++	struct mnl_socket *sock;
++	struct nftnl_set *set;
++	struct nlmsghdr *nlh;
++	char buf[MNL_SOCKET_BUFFER_SIZE];
++	uint32_t seq = 1, portid;
++	int ret = -1, saved_errno;
++	struct reservation_snapshot snapshot = { .ifname = ifname };
++	mnl_cb_t control[NLMSG_MIN_TYPE] = {
++		[NLMSG_DONE] = reservation_done_cb,
++		[NLMSG_ERROR] = reservation_error_cb
++	};
++
++	memset(trigger_reserved, 0, sizeof(trigger_reserved));
++	if (!ifname || !*ifname) {
++		errno = EINVAL;
++		return -1;
++	}
++	sock = mnl_socket_open(NETLINK_NETFILTER);
++	if (!sock)
++		return -1;
++	if (mnl_socket_bind(sock, 0, MNL_SOCKET_AUTOPID) < 0)
++		goto out;
++	portid = mnl_socket_get_portid(sock);
++	set = nftnl_set_alloc();
++	if (!set)
++		goto out;
++	nftnl_set_set_str(set, NFTNL_SET_TABLE, "fw4");
++	nftnl_set_set_str(set, NFTNL_SET_NAME, "port_trigger_ports");
++	nlh = nftnl_nlmsg_build_hdr(buf, NFT_MSG_GETSETELEM, NFPROTO_INET,
++				    NLM_F_DUMP, seq);
++	nftnl_set_elems_nlmsg_build_payload(nlh, set);
++	nftnl_set_free(set);
++	if (mnl_socket_sendto(sock, nlh, nlh->nlmsg_len) < 0)
++		goto out;
++	do {
++		ret = mnl_socket_recvfrom(sock, buf, sizeof(buf));
++		if (ret <= 0) {
++			if (!ret) errno = EIO;
++			ret = -1;
++			break;
++		}
++		ret = mnl_cb_run2(buf, ret, seq, portid, reservation_dump_cb,
++				  &snapshot, control, NLMSG_MIN_TYPE);
++	} while (ret > 0);
++	/* A missing set is the defined compatibility case for ordinary fw4. */
++	if (ret < 0 && snapshot.missing) {
++		memset(trigger_reserved, 0, sizeof(trigger_reserved));
++		ret = 0;
++	} else if (!ret && !snapshot.complete) {
++		errno = EPROTO;
++		ret = -1;
++	}
++out:
++	saved_errno = errno;
++	mnl_socket_close(sock);
++	errno = saved_errno;
++	return ret;
++}
++
++int
++port_mapping_begin(const char *ifname, int wait)
++{
++	if (mapping_depth) {
++		mapping_depth++;
++		return 0;
++	}
++	mapping_lock = open("/var/run/fw4.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
++	if (mapping_lock < 0)
++		return -1;
++	if (flock(mapping_lock, LOCK_EX | (wait ? 0 : LOCK_NB)) < 0 || snapshot_trigger_reservations(ifname) < 0) {
++		int saved_errno = errno;
++		close(mapping_lock);
++		mapping_lock = -1;
++		errno = saved_errno;
++		syslog(LOG_ERR, "Cannot read fw4 port reservations: %m");
++		return -1;
++	}
++	mapping_depth = 1;
++	/* A previous full fw4 reload may have withdrawn every daemon rule. */
++	rule_list_redirect_validate = RULE_CACHE_INVALID;
++	rule_list_filter_validate = RULE_CACHE_INVALID;
++	rule_list_peer_validate = RULE_CACHE_INVALID;
++	return 0;
++}
++
++void
++port_mapping_end(void)
++{
++	if (mapping_depth && --mapping_depth == 0) {
++		close(mapping_lock);
++		mapping_lock = -1;
++	}
++}
++
++int
++port_mapping_reserved(unsigned short port, int proto)
++{
++	if (!mapping_depth)
++		return -1;
++	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
++		return 0;
++	return !!(trigger_reserved[proto == IPPROTO_UDP][port / 8] & (1U << (port % 8)));
++}
+ 
+ /*
+  * return : 0 for OK, -1 for error
+--- a/pcpserver.c
++++ b/pcpserver.c
+@@ -910,7 +910,7 @@
+ }
+ #endif /* PCP_PEER */
+ 
+-static int CreatePCPMap_NAT(pcp_info_t *pcp_msg_info)
++static int CreatePCPMap_NAT_locked(pcp_info_t *pcp_msg_info)
+ {
+ 	int r = 0;
+ 	char iaddr_old[INET6_ADDRSTRLEN];
+@@ -949,6 +949,13 @@
+ 			if (pcp_msg_info->ext_port == 0) { /* skip port zero */
+ 				pcp_msg_info->ext_port++;
+ 			}
++			continue;
++		}
++		if (port_mapping_reserved(pcp_msg_info->ext_port, pcp_msg_info->protocol)) {
++			if (pcp_msg_info->pfailure_present)
++				return PCP_ERR_CANNOT_PROVIDE_EXTERNAL;
++			pcp_msg_info->ext_port++;
++			if (!pcp_msg_info->ext_port) pcp_msg_info->ext_port++;
+ 			continue;
+ 		}
+ 		any_eport_allowed = 1;
+@@ -1008,6 +1015,16 @@
+ 	if (r < 0)
+ 		return PCP_ERR_NO_RESOURCES;
+ 	return PCP_SUCCESS;
++}
++
++static int CreatePCPMap_NAT(pcp_info_t *pcp_msg_info)
++{
++	int result;
++	if (port_mapping_begin(ext_if_name, 0) < 0)
++		return PCP_ERR_NO_RESOURCES;
++	result = CreatePCPMap_NAT_locked(pcp_msg_info);
++	port_mapping_end();
++	return result;
+ }
+ 
+ static int CreatePCPMap_FW(pcp_info_t *pcp_msg_info)
+--- a/upnpredirect.c
++++ b/upnpredirect.c
+@@ -21,6 +21,7 @@
+ 
+ #include "macros.h"
+ #include "config.h"
++#include "commonrdr.h"
+ #include "upnpredirect.h"
+ #include "upnpglobalvars.h"
+ #include "upnpevents.h"
+@@ -154,7 +155,7 @@
+ /* reload_from_lease_file()
+  * read lease_file and add the rules contained
+  */
+-int reload_from_lease_file(void)
++static int reload_from_lease_file_locked(void)
+ {
+ 	FILE * fd;
+ 	char * p;
+@@ -265,6 +266,21 @@
+ 	return 0;
+ }
+ 
++int reload_from_lease_file(void)
++{
++	int result;
++	if (!lease_file)
++		return -1;
++	/* Startup precedes the request loop. Wait before unlinking the input so
++	 * an ordinary concurrent firewall reload cannot discard saved leases.
++	 */
++	if (port_mapping_begin(ext_if_name, 1) < 0)
++		return -1;
++	result = reload_from_lease_file_locked();
++	port_mapping_end();
++	return result;
++}
++
+ #ifdef LEASEFILE_USE_REMAINING_TIME
+ void lease_file_rewrite(void)
+ {
+@@ -300,8 +316,8 @@
+  *          -3 permission check failed
+  *          -4 already redirected (other mechanism)
+  */
+-int
+-upnp_redirect(const char * rhost, unsigned short eport,
++static int
++upnp_redirect_locked(const char * rhost, unsigned short eport,
+               const char * iaddr, unsigned short iport,
+               const char * protocol, const char * desc,
+               unsigned int leaseduration)
+@@ -406,7 +422,25 @@
+ }
+ 
+ int
+-upnp_redirect_internal(const char * rhost, unsigned short eport,
++upnp_redirect(const char * rhost, unsigned short eport,
++              const char * iaddr, unsigned short iport,
++              const char * protocol, const char * desc,
++              unsigned int leaseduration)
++{
++	int result;
++	if (port_mapping_begin(ext_if_name, 0) < 0)
++		return -1;
++	result = port_mapping_reserved(eport, proto_atoi(protocol));
++	if (!result)
++		result = upnp_redirect_locked(rhost, eport, iaddr, iport, protocol, desc, leaseduration);
++	else
++		result = result > 0 ? -4 : -1;
++	port_mapping_end();
++	return result;
++}
++
++static int
++upnp_redirect_internal_locked(const char * rhost, unsigned short eport,
+                        const char * iaddr, unsigned short iport,
+                        int proto, const char * desc,
+                        unsigned int timestamp)
+@@ -442,6 +476,24 @@
+ 	upnp_event_var_change_notify(EWanIPC);
+ #endif
+ 	return 0;
++}
++
++int
++upnp_redirect_internal(const char * rhost, unsigned short eport,
++                       const char * iaddr, unsigned short iport,
++                       int proto, const char * desc,
++                       unsigned int timestamp)
++{
++	int result;
++	if (port_mapping_begin(ext_if_name, 0) < 0)
++		return -1;
++	result = port_mapping_reserved(eport, proto);
++	if (!result)
++		result = upnp_redirect_internal_locked(rhost, eport, iaddr, iport, proto, desc, timestamp);
++	else
++		result = result > 0 ? -4 : -1;
++	port_mapping_end();
++	return result;
+ }
+ 
+ 
+--- a/upnpsoap.c
++++ b/upnpsoap.c
+@@ -22,6 +22,7 @@
+ 
+ #include "macros.h"
+ #include "config.h"
++#include "commonrdr.h"
+ #include "upnpglobalvars.h"
+ #include "upnphttp.h"
+ #include "upnpsoap.h"
+@@ -768,6 +769,12 @@
+ 			SoapError(h, 606, "Action not authorized");
+ 			return;
+ 		}
++	}
++
++	if (port_mapping_begin(ext_if_name, 0) < 0) {
++		ClearNameValueList(&data);
++		SoapError(h, 501, "Action Failed");
++		return;
+ 	}
+ 
+ 	/* first try the port asked in request, then
+@@ -809,6 +816,7 @@
+ 		}
+ 	}
+ 
++	port_mapping_end();
+ 	ClearNameValueList(&data);
+ 
+ 	switch(r)
