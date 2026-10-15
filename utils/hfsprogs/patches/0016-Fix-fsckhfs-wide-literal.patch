@@ -1,11 +1,21 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] fsck_hfs: copy a complete fixed-size dummy volume name
+
+Use a zero-initialized Str27 object rather than reading sizeof(Str27) bytes
+from a shorter string literal. Preserve the Pascal length byte and name.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/fsck_hfs.tproj/dfalib/SVerify1.c
 +++ b/fsck_hfs.tproj/dfalib/SVerify1.c
-@@ -3454,7 +3454,7 @@ OSErr	VLockedChk( SGlobPtr GPtr )
+@@ -3454,7 +3454,8 @@ OSErr	VLockedChk( SGlobPtr GPtr )
  	}
  	else		//	Because we don't have the unicode converters, just fill it with a dummy name.
  	{
 -		CopyMemory( "\x0dPure HFS Plus", calculatedVCB->vcbVN, sizeof(Str27) );
-+		CopyMemory( "u\x0dPure HFS Plus", calculatedVCB->vcbVN, sizeof(Str27) );
++		static const Str27 dummyName = "\x0dPure HFS Plus";
++		CopyMemory( dummyName, calculatedVCB->vcbVN, sizeof(dummyName) );
  	}
  		
  	GPtr->TarBlock = hint;
