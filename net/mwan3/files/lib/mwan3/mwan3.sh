@@ -263,22 +263,17 @@ mwan3_route_table_available()
 mwan3_route_key()
 {
 	printf '%s\n' "$1" | awk '
-		{ type=1; dst=$1; from="all"; metric=0; tos=0;
+		{ dst=$1; from="all"; metric=0; tos=0;
 		  if ($1 ~ /^(unicast|local|broadcast|anycast|multicast|throw|unreachable|prohibit|blackhole|nat|xresolve|failed_policy)$/) {
-		    type=$1; dst=$2;
-		    types["unicast"]=1; types["local"]=2; types["broadcast"]=3;
-		    types["anycast"]=4; types["multicast"]=5; types["blackhole"]=6; types["unreachable"]=7;
-		    types["prohibit"]=8; types["throw"]=9; types["nat"]=10;
-		    types["xresolve"]=11; types["failed_policy"]=12;
-		    type=types[type];
+		    dst=$2;
 		  }
-		  if ($1 ~ /^[0-9]+$/) { type=$1; dst=$2; }
+		  if ($1 ~ /^[0-9]+$/) dst=$2;
 		  for (i=2; i<NF; i++) {
 		    if ($i == "from") from=$(i+1);
 		    if ($i == "metric") metric=$(i+1);
 		    if ($i == "tos") tos=$(i+1);
 		  }
-		  print type, dst, from, metric, tos;
+		  print dst, from, metric, tos;
 		}'
 }
 
@@ -291,11 +286,11 @@ mwan3_route_change()
 		$IP route del table "$table" $route proto "$MWAN3_ROUTE_PROTOCOL"
 		return
 	fi
-	mwan3_route_table_available "$table" || {
+	owned=$(mwan3_table_routes "$table") || return 1
+	[ -z "$(printf '%s\n' "$owned" | sed '/^$/d; / proto '"$MWAN3_ROUTE_PROTOCOL"'\( \|$\)/d')" ] || {
 		LOG err "Refusing foreign routes in table $table"
 		return 1
 	}
-	owned=$(mwan3_table_routes "$table") || return 1
 	owned=$(printf '%s\n' "$owned" | sed -n '/ proto '"$MWAN3_ROUTE_PROTOCOL"'\( \|$\)/p')
 	# Keep an identical copy. On an update, withdraw only our exact old route
 	# to this destination; an exclusive add preserves an intervening producer.
