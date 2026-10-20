@@ -1,0 +1,60 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] usteer: use native station signal when no average is available
+
+NL80211_STA_INFO_SIGNAL_AVG is optional. Drivers which publish the measured
+NL80211_STA_INFO_SIGNAL must still supply connected-station policy input.
+Prefer the average when present and decode either native field as signed dBm.
+
+Initialize stations without a measurement to NO_SIGNAL, not calloc's zero,
+and exclude unmeasured sources and target candidates from roaming decisions.
+Neither path invents an average or replaces an absent measurement.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/nl80211.c
++++ b/nl80211.c
+@@ -269,6 +269,9 @@
+ 
+ 	if (tb_sta[NL80211_STA_INFO_SIGNAL_AVG])
+ 		signal = (int8_t) nla_get_u8(tb_sta[NL80211_STA_INFO_SIGNAL_AVG]);
++	else if (tb_sta[NL80211_STA_INFO_SIGNAL])
++		/* Not all drivers maintain an average; use their measured signal. */
++		signal = (int8_t) nla_get_u8(tb_sta[NL80211_STA_INFO_SIGNAL]);
+ 	
+ 	if (tb_sta[NL80211_STA_INFO_CONNECTED_TIME])
+ 		si->connected_since = current_time - (nla_get_u32(tb_sta[NL80211_STA_INFO_CONNECTED_TIME]) * 1000);
+--- a/sta.c
++++ b/sta.c
+@@ -122,6 +122,8 @@
+ 	    MAC_ADDR_DATA(sta->addr), usteer_node_name(node));
+ 
+ 	si = calloc(1, sizeof(*si));
++	si->signal = NO_SIGNAL;
++	si->band_steering.signal_threshold = NO_SIGNAL;
+ 	si->node = node;
+ 	si->sta = sta;
+ 	list_add(&si->list, &sta->nodes);
+--- a/policy.c
++++ b/policy.c
+@@ -76,6 +76,9 @@
+ static bool
+ over_min_signal(struct usteer_node *node, int signal)
+ {
++	if (signal == NO_SIGNAL)
++		return false;
++
+ 	if (config.min_snr && signal < usteer_snr_to_signal(node, config.min_snr))
+ 		return false;
+ 
+@@ -414,6 +417,10 @@
+ 	if (si->connected != STA_CONNECTED)
+ 		return false;
+ 
++	/* An unmeasured station is not a high-signal steering candidate. */
++	if (si->signal == NO_SIGNAL)
++		return false;
++
+ 	/* Only trigger for STA with active roaming */
+ 	if (!si->sta->aggressiveness)
+ 		return false;
