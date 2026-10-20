@@ -9,6 +9,37 @@ CONFIG=/var/etc/pptpd.conf
 CHAP_SECRETS=/var/etc/chap-secrets
 OPTIONS_PPTP=/var/etc/options.pptpd
 
+pptpd_mppe_options() {
+	local option required no40 no128 stateful
+
+	for option in $(printf '%s' "$1" | tr ',' ' '); do
+		case "$option" in
+			required) required=1 ;;
+			no40) no40=1 ;;
+			no56) ;; # pppd does not support 56-bit MPPE.
+			no128) no128=1 ;;
+			stateless) stateful=nomppe-stateful ;;
+			stateful) stateful=mppe-stateful ;;
+			*) echo "pptpd: unsupported MPPE option '$option'" >&2; return 1 ;;
+		esac
+	done
+
+	[ -n "$required" ] || {
+		echo "pptpd: pppd requires MPPE to be mandatory" >&2
+		return 1
+	}
+	[ -z "$no40" ] || [ -z "$no128" ] || {
+		echo "pptpd: no supported MPPE key length remains" >&2
+		return 1
+	}
+
+	# Apply exclusions after enabling MPPE, regardless of UCI list order.
+	echo require-mppe
+	[ -z "$no40" ] || echo nomppe-40
+	[ -z "$no128" ] || echo nomppe-128
+	[ -z "$stateful" ] || echo "$stateful"
+}
+
 validate_login_section() {
 	uci_load_validate pptpd login "$1" "$2" \
 		'username:string' \
@@ -54,7 +85,7 @@ setup_config() {
 	[ -n "$remoteip" ] && echo "remoteip  $remoteip" >> $CONFIG
 	[ "$logwtmp" -eq 1 ] && echo "logwtmp" >> $CONFIG
 
-	echo "mppe $(echo $mppe | sed -e 's/\s/,/g')" >> $OPTIONS_PPTP
+	pptpd_mppe_options "$mppe" >> "$OPTIONS_PPTP" || return 1
 
 	return 0
 }
