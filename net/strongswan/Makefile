@@ -665,7 +665,9 @@ $(eval $(call BuildPlugin,ha,high availability cluster,))
 $(eval $(call BuildPlugin,hmac,HMAC crypto,))
 $(eval $(call BuildPlugin,kdf,KDF/PRF+,))
 $(eval $(call BuildPlugin,kernel-libipsec,libipsec kernel interface,))
-$(eval $(call BuildPlugin,kernel-netlink,netlink kernel interface,))
+# Default ESP/AH proposals use these algorithms in the kernel, independently
+# of the userspace crypto provider used for IKE.
+$(eval $(call BuildPlugin,kernel-netlink,netlink kernel interface,+kmod-crypto-gcm +kmod-crypto-sha256 +kmod-crypto-sha512 +kmod-crypto-xcbc))
 $(eval $(call BuildPlugin,ldap,LDAP,+PACKAGE_strongswan-mod-ldap:libopenldap))
 $(eval $(call BuildPlugin,load-tester,load testing,))
 $(eval $(call BuildPlugin,lookip,enable fast virtual IP lookup and notification,))
