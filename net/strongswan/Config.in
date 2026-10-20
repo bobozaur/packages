@@ -14,6 +14,13 @@ config STRONGSWAN_ROUTING_TABLE_PRIO
 	prompt "Set the IPsec routing table priority"
 	default "220"
 
+config STRONGSWAN_IKEV1
+	bool "Enable IKEv1 compatibility"
+	default y
+	help
+	  Keep IKEv1 support available for existing configurations.
+	  Disable this option for installations using IKEv2 exclusively.
+
 config STRONGSWAN_INCLUDE_INSECURE
 	bool
 	prompt "Include cryptographically weak protocols"
