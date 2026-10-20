@@ -1,0 +1,572 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] pingcheck: publish authoritative native uplink state
+
+Resolve ordered logical-interface aliases using current netifd status, preserve
+unknown and pending states, and invalidate probes before deferred status queries.
+Publish status changes over ubus and expose the selected interface and family.
+Initialize timers before any state publication; an empty probe set is unknown.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/main.c
++++ b/main.c
+@@ -24,6 +24,13 @@
+ 
+ /* timeout for panic scripts */
+ static struct uloop_timeout timeout_panic;
++static struct uloop_timeout timeout_refresh;
++static unsigned int generation;
++
++unsigned int network_generation(void)
++{
++	return generation;
++}
+ 
+ void state_change(enum online_state state_new, struct ping_intf* pi)
+ {
+@@ -46,7 +53,9 @@
+ 		uloop_timeout_cancel(&timeout_panic);
+ 	}
+ 
+-	scripts_run(pi, state_new);
++	if (state_new == ONLINE || state_new == OFFLINE || state_new == DOWN)
++		scripts_run(pi, state_new);
++	ubus_state_changed();
+ }
+ 
+ const char* get_status_str(enum online_state state)
+@@ -71,12 +80,16 @@
+ 
+ enum online_state get_global_status(void)
+ {
+-	for (int i = 0; i < MAX_NUM_INTERFACES && intf[i].name[0]; i++) {
+-		if (intf[i].state == ONLINE) {
++	bool pending = false, configured = false;
++	for (int i = 0; i < MAX_NUM_INTERFACES && intf[i].name[0]; i++) {
++		if (intf[i].conf_disabled)
++			continue;
++		configured = true;
++		if (intf[i].state == ONLINE)
+ 			return ONLINE;
+-		}
+-	}
+-	return OFFLINE;
++		pending |= intf[i].state == UNKNOWN || intf[i].state == UP;
++	}
++	return !configured || pending ? UNKNOWN : OFFLINE;
+ }
+ 
+ int get_online_interface_names(const char** dest, int destLen)
+@@ -101,22 +114,34 @@
+ 	return i;
+ }
+ 
+-/* called from ubus interface event */
++static void refresh_interfaces(struct uloop_timeout* timeout)
++{
++	for (int i = 0; i < MAX_NUM_INTERFACES && intf[i].name[0]; i++)
++		if (!intf[i].conf_disabled)
++			ping_refresh(&intf[i]);
++	if (!timeout->pending)
++		uloop_timeout_set(timeout, 10000);
++}
++
++/* Events invalidate success before the deferred authoritative status query. */
+ void notify_interface(const char* interface, const char* action)
+ {
+-	struct ping_intf* pi = get_interface(interface);
+-	if (pi == NULL) {
++	if (strcmp(action, "ifup") && strcmp(action, "ifdown") &&
++		strcmp(action, "ifupdate"))
+ 		return;
+-	}
+-
+-	if (strcmp(action, "ifup") == 0) {
+-		LOG_INF("Interface '%s' event UP", interface);
+-		ping_init(pi);
+-		ping_send(pi);
+-	} else if (strcmp(action, "ifdown") == 0) {
+-		LOG_INF("Interface '%s' event DOWN", interface);
+-		ping_stop(pi);
+-		state_change(DOWN, pi);
++	for (int i = 0; i < MAX_NUM_INTERFACES && intf[i].name[0]; i++) {
++		char names[MAX_IFNAME_LEN], *save, *name;
++		strcpy(names, intf[i].conf_interfaces);
++		for (name = strtok_r(names, " \t\n", &save); name;
++			 name = strtok_r(NULL, " \t\n", &save)) {
++			if (strcmp(name, interface))
++				continue;
++			generation++;
++			ping_stop(&intf[i]);
++			state_change(UNKNOWN, &intf[i]);
++			uloop_timeout_set(&timeout_refresh, 1);
++			break;
++		}
+ 	}
+ }
+ 
+@@ -172,6 +197,7 @@
+ 	int ret;
+ 
+ 	log_open("pingcheck");
++	scripts_init();
+ 
+ 	ret = uloop_init();
+ 	if (ret < 0) {
+@@ -186,8 +212,6 @@
+ 		goto exit;
+ 	}
+ 
+-	scripts_init();
+-
+ 	ret = ubus_init();
+ 	if (!ret) {
+ 		goto exit;
+@@ -200,21 +224,15 @@
+ 		goto exit;
+ 	}
+ 
+-	ubus_register_server();
+-
+-	/* start ping on all available interfaces */
+-	for (int i = 0; i < MAX_NUM_INTERFACES && intf[i].name[0]; i++) {
+-		if (!intf[i].conf_disabled) {
+-			ping_init(&intf[i]);
+-		}
+-	}
+-
+-	/* initialize panic handler */
++	if (!ubus_register_server()) {
++		ret = 0;
++		goto exit;
++	}
++
++	/* Initialize every timer before callbacks can produce state changes. */
+ 	timeout_panic.cb = uto_panic_cb;
+-	if (intf[0].conf_panic_timeout > 0) {
+-		uloop_timeout_set(&timeout_panic,
+-						  intf[0].conf_panic_timeout * 60 * 1000);
+-	}
++	timeout_refresh.cb = refresh_interfaces;
++	uloop_timeout_set(&timeout_refresh, 1);
+ 
+ 	/* main loop */
+ 	uloop_run();
+@@ -225,7 +243,7 @@
+ 		if (!intf[i].conf_disabled) {
+ 			printf("%s:\t%-8s %3.0f%% (%d/%d on %s)\n", intf[i].name,
+ 				   get_status_str(intf[i].state),
+-				   (float)intf[i].cnt_succ * 100 / intf[i].cnt_sent,
++				   intf[i].cnt_sent ? (float)intf[i].cnt_succ * 100 / intf[i].cnt_sent : 0,
+ 				   intf[i].cnt_succ, intf[i].cnt_sent, intf[i].device);
+ 			ping_stop(&intf[i]);
+ 		}
+--- a/main.h
++++ b/main.h
+@@ -45,6 +45,7 @@
+ 	/* public state */
+ 	char name[MAX_IFNAME_LEN];
+ 	char device[MAX_IFNAME_LEN];
++	char interface[MAX_IFNAME_LEN];
+ 	enum online_state state;
+ 	unsigned int cnt_sent;
+ 	unsigned int cnt_succ;
+@@ -94,13 +95,15 @@
+ 
+ // ping.c
+ bool ping_init(struct ping_intf* pi);
++void ping_refresh(struct ping_intf* pi);
+ bool ping_send(struct ping_intf* pi);
+ void ping_stop(struct ping_intf* pi);
+ 
+ // ubus.c
+ bool ubus_init(void);
+ bool ubus_listen_network_events(void);
+-int ubus_interface_get_status(const char* name, char* device, size_t device_len);
++int ubus_interface_get_status(struct ping_intf* pi, char* device, char* interface);
++void ubus_state_changed(void);
+ bool ubus_register_server(void);
+ void ubus_finish(void);
+ 
+@@ -114,6 +117,7 @@
+ void scripts_finish(void);
+ 
+ // main.c
++unsigned int network_generation(void);
+ void notify_interface(const char* interface, const char* action);
+ struct ping_intf* get_interface_by_fd(int fd);
+ struct ping_intf* get_interface(const char* interface);
+--- a/ping.c
++++ b/ping.c
+@@ -102,27 +102,6 @@
+ 
+ 	if (pi->active)
+ 		return true;
+-	if (!pi->conf_ignore_ubus) {
+-		ret = ubus_interface_get_status(pi->name, pi->device, MAX_IFNAME_LEN);
+-		if (ret < 0) {
+-			LOG_INF("Interface '%s' not found or error", pi->name);
+-			pi->state = UNKNOWN;
+-			return false;
+-		} else if (ret == 0) {
+-			LOG_INF("Interface '%s' not up", pi->name);
+-			pi->state = DOWN;
+-			return false;
+-		} else if (ret == 1) {
+-			LOG_INF("Interface '%s' (%s) has no default route but local one",
+-					pi->name, pi->device);
+-			pi->state = UP_WITHOUT_DEFAULT_ROUTE;
+-		} else if (ret == 2) {
+-			pi->state = UP;
+-		}
+-	} else {
+-		pi->state = UP;
+-	}
+-
+ 	LOG_INF("Init %s ping on '%s' (%s)", pi->conf_proto == TCP ? "TCP" : "ICMP",
+ 			pi->name, pi->device);
+ 
+@@ -178,6 +157,36 @@
+ 	return true;
+ }
+ 
++void ping_refresh(struct ping_intf* pi)
++{
++	char device[MAX_IFNAME_LEN] = {0}, interface[MAX_IFNAME_LEN] = {0};
++	int status;
++	unsigned int generation = network_generation();
++	if (pi->conf_ignore_ubus) {
++		snprintf(device, sizeof(device), "%s", pi->conf_interfaces);
++		snprintf(interface, sizeof(interface), "%s", pi->conf_interfaces);
++		status = 2;
++	} else {
++		status = ubus_interface_get_status(pi, device, interface);
++	}
++	if (generation != network_generation())
++		return;
++	if (status < 2 && (status != 1 || pi->conf_require_default)) {
++		ping_stop(pi);
++		state_change(status < 0 ? UNKNOWN : status == 0 ? DOWN :
++					 UP_WITHOUT_DEFAULT_ROUTE, pi);
++		return;
++	}
++	if (pi->active && !strcmp(device, pi->device) &&
++		!strcmp(interface, pi->interface))
++		return;
++	ping_stop(pi);
++	memcpy(pi->device, device, sizeof(device));
++	memcpy(pi->interface, interface, sizeof(interface));
++	if (!ping_init(pi))
++		state_change(UNKNOWN, pi);
++}
++
+ static bool ping_resolve(struct ping_intf* pi)
+ {
+ 	struct addrinfo hints = {0}, *addr = NULL;
+--- a/ubus.c
++++ b/ubus.c
+@@ -59,7 +59,7 @@
+ 	interface_event_handler.cb = ubus_receive_interface_event;
+ 	int ret = ubus_register_event_handler(ctx, &interface_event_handler,
+ 										  "network.interface");
+-	if (ret < 0) {
++	if (ret) {
+ 		return false;
+ 	}
+ 
+@@ -67,150 +67,114 @@
+ 	return true;
+ }
+ 
+-/*** generic result callback: just copies msg to last_result_msg ***/
+-
+-static struct blob_attr* last_result_msg;
+-
+-static void ubus_result_cb(__attribute__((unused)) struct ubus_request* req,
+-						   __attribute__((unused)) int type,
+-						   struct blob_attr* msg)
+-{
+-	if (!msg) {
++/* The reply belongs to this invocation, including nested event delivery. */
++static void ubus_result_cb(struct ubus_request* req, int type, struct blob_attr* msg)
++{
++	struct blob_attr** result = req->priv;
++	(void)type;
++	free(*result);
++	*result = msg ? blob_memdup(msg) : NULL;
++}
++
++enum { IF_NAME, IF_UP, IF_PENDING, IF_DEVICE, IF_L3DEVICE, IF_ROUTE, __IF_MAX };
++static const struct blobmsg_policy if_policy[] = {
++	[IF_NAME] = { .name = "interface", .type = BLOBMSG_TYPE_STRING },
++	[IF_UP] = { .name = "up", .type = BLOBMSG_TYPE_BOOL },
++	[IF_PENDING] = { .name = "pending", .type = BLOBMSG_TYPE_BOOL },
++	[IF_DEVICE] = { .name = "device", .type = BLOBMSG_TYPE_STRING },
++	[IF_L3DEVICE] = { .name = "l3_device", .type = BLOBMSG_TYPE_STRING },
++	[IF_ROUTE] = { .name = "route", .type = BLOBMSG_TYPE_ARRAY },
++};
++enum { ROUTE_TARGET, ROUTE_MASK, ROUTE_TYPE, __ROUTE_MAX };
++static const struct blobmsg_policy route_policy[] = {
++	[ROUTE_TARGET] = { .name = "target", .type = BLOBMSG_TYPE_STRING },
++	[ROUTE_MASK] = { .name = "mask", .type = BLOBMSG_TYPE_INT32 },
++	[ROUTE_TYPE] = { .name = "type", .type = BLOBMSG_TYPE_INT32 },
++};
++
++static bool default_route(struct blob_attr* routes, int family)
++{
++	struct blob_attr* attr;
++	int remaining;
++	if (!routes)
++		return false;
++	blobmsg_for_each_attr(attr, routes, remaining) {
++		struct blob_attr* tb[__ROUTE_MAX];
++		blobmsg_parse(route_policy, __ROUTE_MAX, tb,
++					  blobmsg_data(attr), blobmsg_data_len(attr));
++		if (!tb[ROUTE_TARGET] || !tb[ROUTE_MASK] || blobmsg_get_u32(tb[ROUTE_MASK]))
++			continue;
++		if (tb[ROUTE_TYPE] && blobmsg_get_u32(tb[ROUTE_TYPE]) != 1)
++			continue;
++		const char* target = blobmsg_get_string(tb[ROUTE_TARGET]);
++		if (!strcmp(target, family == AF_INET6 ? "::" : "0.0.0.0"))
++			return true;
++	}
++	return false;
++}
++
++/* A successful dump establishes both presence and absence. Candidate names
++ * are explicit ordered aliases; independent uplinks use independent probes. */
++int ubus_interface_get_status(struct ping_intf* pi, char* device, char* interface)
++{
++	struct blob_attr* reply = NULL;
++	uint32_t id;
++	int result = -1;
++	bool pending = false;
++	if (ubus_lookup_id(ctx, "network.interface", &id) ||
++		ubus_invoke(ctx, id, "dump", NULL, ubus_result_cb, &reply, UBUS_TIMEOUT) ||
++		!reply)
++		goto out;
++	const struct blobmsg_policy policy = { .name = "interface", .type = BLOBMSG_TYPE_ARRAY };
++	struct blob_attr* entries;
++	blobmsg_parse(&policy, 1, &entries, blob_data(reply), blob_len(reply));
++	if (!entries)
++		goto out;
++	result = 0;
++	char names[MAX_IFNAME_LEN], *save, *name;
++	strcpy(names, pi->conf_interfaces);
++	for (name = strtok_r(names, " \t\n", &save); name;
++		 name = strtok_r(NULL, " \t\n", &save)) {
++		struct blob_attr* entry;
++		int remaining;
++		blobmsg_for_each_attr(entry, entries, remaining) {
++			struct blob_attr* tb[__IF_MAX];
++			blobmsg_parse(if_policy, __IF_MAX, tb,
++						  blobmsg_data(entry), blobmsg_data_len(entry));
++			if (!tb[IF_NAME] || strcmp(blobmsg_get_string(tb[IF_NAME]), name))
++				continue;
++			pending |= tb[IF_PENDING] && blobmsg_get_bool(tb[IF_PENDING]);
++			if (!tb[IF_UP] || !blobmsg_get_bool(tb[IF_UP]))
++				continue;
++			struct blob_attr* dev = tb[IF_L3DEVICE] ? tb[IF_L3DEVICE] : tb[IF_DEVICE];
++			if (!dev || strlen(blobmsg_get_string(dev)) >= MAX_IFNAME_LEN)
++				continue;
++			bool route = default_route(tb[IF_ROUTE], pi->conf_family);
++			result = 1;
++			if (!route && pi->conf_require_default)
++				continue;
++			strcpy(device, blobmsg_get_string(dev));
++			strcpy(interface, name);
++			result = route ? 2 : 1;
++			goto out;
++		}
++	}
++	if (pending)
++		result = -1;
++out:
++	free(reply);
++	return result;
++}
++
++void ubus_state_changed(void)
++{
++	if (!ctx)
+ 		return;
+-	}
+-
+-	unsigned int len = blob_raw_len(msg);
+-	last_result_msg = malloc(len);
+-	memcpy(last_result_msg, msg, len);
+-	// client needs to free(last_result_msg);
+-}
+-
+-/*** network interface status ***/
+-
+-static bool ubus_interface_status(const char* name)
+-{
+-	uint32_t id;
+-	int ret;
+-	char idstr[32];
+-
+-	ret = snprintf(idstr, sizeof(idstr), "network.interface.%s", name);
+-	if (ret <= 0 || (unsigned int)ret >= sizeof(idstr)) { // error or truncated
+-		return false;
+-	}
+-
+-	ret = ubus_lookup_id(ctx, idstr, &id);
+-	if (ret) {
+-		return false;
+-	}
+-
+-	ret = ubus_invoke(ctx, id, "status", NULL, ubus_result_cb, NULL,
+-					  UBUS_TIMEOUT);
+-	if (ret < 0) {
+-		return false;
+-	}
+-
+-	// client needs to free(last_result_msg);
+-	return true;
+-}
+-
+-enum {
+-	IFSTAT_UP,
+-	IFSTAT_DEVICE,
+-	IFSTAT_L3DEVICE,
+-	IFSTAT_ROUTE,
+-	IFSTAT_TARGET,
+-};
+-
+-static const struct blobmsg_policy ifstat_policy[] = {
+-	[IFSTAT_UP] = {.name = "up", .type = BLOBMSG_TYPE_BOOL},
+-	[IFSTAT_DEVICE] = {.name = "device", .type = BLOBMSG_TYPE_STRING},
+-	[IFSTAT_L3DEVICE] = {.name = "l3_device", .type = BLOBMSG_TYPE_STRING},
+-	[IFSTAT_ROUTE] = {.name = "route", .type = BLOBMSG_TYPE_ARRAY},
+-};
+-
+-enum {
+-	ROUTE_TARGET,
+-};
+-
+-static const struct blobmsg_policy route_policy[] = {
+-	[ROUTE_TARGET] = {.name = "target", .type = BLOBMSG_TYPE_STRING},
+-};
+-
+-/*
+- * checks interface is up and default route goes thru it
+- *
+- * returns: -1 error or not found
+- * 	     0 down
+- * 	     1 up but no default route
+- * 	     2 default route exists
+- */
+-int ubus_interface_get_status(const char* name, char* device, size_t device_len)
+-{
+-	int ret;
+-	const char* dev;
+-	const char* route;
+-
+-	ret = ubus_interface_status(name);
+-	if (!ret) {
+-		return -1;
+-	}
+-
+-	struct blob_attr* tb[ARRAY_SIZE(ifstat_policy)];
+-	blobmsg_parse(ifstat_policy, ARRAY_SIZE(ifstat_policy), tb,
+-				  blob_data(last_result_msg), blob_len(last_result_msg));
+-
+-	// up
+-	if (!tb[IFSTAT_UP]) {
+-		ret = -1;
+-		goto exit; // error
+-	}
+-	if (!blobmsg_get_bool(tb[IFSTAT_UP])) {
+-		ret = 0;
+-		goto exit; // down
+-	}
+-
+-	// device
+-	if (tb[IFSTAT_L3DEVICE]) {
+-		dev = blobmsg_get_string(tb[IFSTAT_L3DEVICE]);
+-	} else if (tb[IFSTAT_DEVICE]) {
+-		dev = blobmsg_get_string(tb[IFSTAT_DEVICE]);
+-	} else {
+-		ret = -1;
+-		goto exit; // error
+-	}
+-	if (strlen(dev) >= device_len) {
+-		LOG_ERR("ubus_interface_get_status: device_len too short");
+-		ret = -1;
+-		goto exit; // error
+-	}
+-	strcpy(device, dev);
+-
+-	// routes
+-	if (!tb[IFSTAT_ROUTE]) {
+-		ret = 1;
+-		goto exit; // up, no route
+-	}
+-	int len = blobmsg_data_len(tb[IFSTAT_ROUTE]);
+-	struct blob_attr* arr = blobmsg_data(tb[IFSTAT_ROUTE]);
+-	struct blob_attr* attr;
+-	__blob_for_each_attr(attr, arr, len)
+-	{
+-		struct blob_attr* tb2[ARRAY_SIZE(route_policy)];
+-		blobmsg_parse(route_policy, ARRAY_SIZE(route_policy), tb2,
+-					  blobmsg_data(attr), blobmsg_data_len(attr));
+-		if (tb2[ROUTE_TARGET]) {
+-			route = blobmsg_get_string(tb2[ROUTE_TARGET]);
+-			if (route != NULL && strcmp(route, "0.0.0.0") == 0) {
+-				ret = 2;
+-				goto exit; // default route found
+-			}
+-		}
+-	}
+-
+-exit:
+-	free(last_result_msg);
+-	last_result_msg = NULL;
+-	return ret;
++	struct blob_buf event = {0};
++	blob_buf_init(&event, 0);
++	blobmsg_add_string(&event, "status", get_status_str(get_global_status()));
++	ubus_send_event(ctx, "pingcheck.state", event.head);
++	blob_buf_free(&event);
+ }
+ 
+ /*** server ***/
+@@ -248,6 +212,9 @@
+ 		blobmsg_add_string(&b, "status", get_status_str(pi->state));
+ 		blobmsg_add_string(&b, "interface", pi->name);
+ 		blobmsg_add_string(&b, "device", pi->device);
++		blobmsg_add_string(&b, "logical_interface", pi->interface);
++		blobmsg_add_string(&b, "family", pi->conf_family == AF_INET6 ? "ipv6" : "ipv4");
++		blobmsg_add_string(&b, "host", pi->conf_hostname);
+ 		blobmsg_add_u32(&b, "percent",
+ 						pi->cnt_sent > 0 ? pi->cnt_succ * 100 / pi->cnt_sent
+ 										 : 0);
+@@ -338,6 +305,12 @@
+ 
+ /*** init / finish ***/
+ 
++static void connection_lost(struct ubus_context* context)
++{
++	(void)context;
++	uloop_end();
++}
++
+ bool ubus_init(void)
+ {
+ 	ctx = ubus_connect(NULL);
+@@ -345,12 +318,12 @@
+ 		LOG_ERR("Failed to connect to ubus");
+ 		return false;
+ 	}
++	ctx->connection_lost = connection_lost;
+ 	return true;
+ }
+ 
+ void ubus_finish(void)
+ {
+-	free(last_result_msg);
+ 	if (ctx == NULL) {
+ 		return;
+ 	}
