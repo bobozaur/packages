@@ -72,18 +72,11 @@ proto_l2tp_setup() {
 
 	# Start and wait for xl2tpd
 	if [ ! -p /var/run/xl2tpd/l2tp-control -o -z "$(pidof xl2tpd)" ]; then
-		/etc/init.d/xl2tpd restart
-
-		local wait_timeout=0
-		while [ ! -p /var/run/xl2tpd/l2tp-control ]; do
-			wait_timeout=$(($wait_timeout + 1))
-			[ "$wait_timeout" -gt 5 ] && {
-				echo "Cannot find xl2tpd control file." >&2
-				proto_setup_failed "$interface"
-				exit 1
-			}
-			sleep 1
-		done
+		/etc/init.d/xl2tpd start || {
+			echo "Cannot start the shared L2TP service." >&2
+			proto_setup_failed "$interface"
+			exit 1
+		}
 	fi
 
 	local ipv6 keepalive username password pppd_options mtu unnumbered localip
@@ -115,9 +108,10 @@ proto_l2tp_setup() {
 usepeerdns
 nodefaultroute
 ipparam "$interface"
+${NETIFD_PROTO_TOKEN:+set NETIFD_PROTO_TOKEN=$NETIFD_PROTO_TOKEN}
 ifname "l2tp-$interface"
 ip-up-script /lib/netifd/ppp-up
-ipv6-up-script /lib/netifd/ppp-up
+ipv6-up-script /lib/netifd/ppp6-up
 ip-down-script /lib/netifd/ppp-down
 ipv6-down-script /lib/netifd/ppp-down
 # Don't wait for LCP term responses; exit immediately when killed.
@@ -130,7 +124,8 @@ $localip
 $pppd_options
 EOF
 
-	xl2tpd-control add-lac l2tp-${interface} pppoptfile=${optfile} lns=${server} ${hostname} || {
+	# xl2tpd owns retries before a PPP device exists to notify netifd.
+	xl2tpd-control add-lac l2tp-${interface} pppoptfile=${optfile} lns=${server} redial=yes ${hostname} || {
 		echo "xl2tpd-control: Add l2tp-$interface failed" >&2
 		proto_setup_failed "$interface"
 		exit 1

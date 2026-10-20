@@ -1,0 +1,60 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] xl2tpd: reply to status-lac on the request channel
+
+Return bounded native LAC state to the requesting control FIFO, including a
+missing-name result, rather than writing an unrelated diagnostic stream.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/xl2tpd.c
++++ b/xl2tpd.c
+@@ -74,7 +74,7 @@
+ static int control_handle_lac_disconnect(FILE* resf, char* bufp);
+ static int control_handle_lac_add_modify(FILE* resf, char* bufp);
+ static int control_handle_lac_remove(FILE* resf, char* bufp);
+-static int control_handle_lac_status();
++static int control_handle_lac_status(FILE* resf, char* bufp);
+ static int control_handle_lns_remove(FILE* resf, char* bufp);
+ 
+ static struct control_requests_handler control_handlers[] = {
+@@ -1559,8 +1559,37 @@
+     return 1;
+ }
+ 
+-static int control_handle_lac_status(){
+-    show_status ();
++static int control_handle_lac_status(FILE* resf, char* bufp){
++    struct lac *lac;
++    char *name = strchr (bufp, ' ');
++
++    if (name)
++        while (*name == ' ')
++            name++;
++    if (!name || !*name)
++    {
++        write_res (resf, "%02i LAC name required\n", 1);
++        return 0;
++    }
++
++    lac = laclist;
++    while (lac && strcasecmp (lac->entname, name))
++        lac = lac->next;
++    if (!lac && deflac && !strcasecmp (deflac->entname, name))
++        lac = deflac;
++    if (!lac)
++    {
++        write_res (resf, "%02i No such tunnel '%s'\n", 1, name);
++        return 0;
++    }
++
++    write_res (resf, "%02i OK\n", 0);
++    write_res (resf, "%02i STATUS name=%s\n", 0, lac->entname);
++    write_res (resf, "%02i STATUS active=%d\n", 0, !!lac->active);
++    write_res (resf, "%02i STATUS tunnel_id=%u\n", 0,
++               lac->t ? (unsigned int)lac->t->ourtid : 0);
++    write_res (resf, "%02i STATUS call_id=%u\n", 0,
++               lac->c ? (unsigned int)lac->c->ourcid : 0);
+     return 1;
+ }
+ 
