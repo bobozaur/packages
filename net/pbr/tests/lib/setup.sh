@@ -76,6 +76,7 @@ sed 's/^readonly //' "$PKG_DIR/files/etc/init.d/pbr" > "$_PBR_TEST_SCRIPT"
 
 # Override file paths to use test-friendly temp locations
 nftTempFile="$MOCK_ROOT/var/run/pbr.nft"
+nftStopFile="$MOCK_ROOT/var/run/pbr.stop.nft"
 nftMainFile="$MOCK_ROOT/usr/share/nftables.d/ruleset-post/30-pbr.nft"
 nftNetifdFile="$MOCK_ROOT/usr/share/nftables.d/ruleset-post/20-pbr-netifd.nft"
 rtTablesFile="$MOCK_ROOT/etc/iproute2/rt_tables"

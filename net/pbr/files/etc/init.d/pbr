@@ -64,6 +64,7 @@ readonly nft="$(command -v nft)"
 readonly nftIPv4Flag='ip'
 readonly nftIPv6Flag='ip6'
 readonly nftTempFile="/var/run/${packageName}.nft"
+readonly nftStopFile="/var/run/${packageName}.stop.nft"
 readonly nftMainFile="/usr/share/nftables.d/ruleset-post/30-${packageName}.nft"
 readonly nftNetifdFile="/usr/share/nftables.d/ruleset-post/20-${packageName}-netifd.nft"
 readonly nftPrefix="$packageName"
@@ -168,6 +169,7 @@ config_compat=
 config_version=
 
 # run-time
+serviceStopResult=0
 aghConfigFile='/etc/AdGuardHome/AdGuardHome.yaml'
 gatewaySummary=
 ifaceMark=
@@ -1038,6 +1040,17 @@ nft_file() {
 		delete:main)
 			rm -f "$nftTempFile" "$nftMainFile"
 		;;
+		uninstall:main)
+			# Netifd operations also replace nftTempFile. Keep this ownership record
+			# separately until withdrawal succeeds, so either lifecycle can retry.
+			if [ -s "$nftMainFile" ]; then
+				mv -f "$nftMainFile" "$nftStopFile" || return 1
+			fi
+			[ -s "$nftStopFile" ] || return 0
+			fw4 -q reload >/dev/null 2>&1 || return 1
+			cleanup 'nft_objects' || return 1
+			rm -f "$nftStopFile" "$nftTempFile"
+		;;
 		delete:netifd)
 			output "Removing fw4 netifd nft file "
 			if rm -f "$nftNetifdFile"; then
@@ -1240,6 +1253,27 @@ cleanup() {
 	local action i prio
 	for action in "$@"; do
 		case "$action" in
+			nft_objects)
+				local type objects live result=0
+				live="$("$nft" list table inet "$nftTable" 2>/dev/null)" || return 1
+				# fw4 flushes rules but retains named chains and sets. Remove only
+				# declarations from our withdrawn include, preserving netifd users.
+				for type in chain set; do
+					objects="$(awk -v type="$type" -v table="$nftTable" '
+						($1 == "add" || $1 == "create") && $2 == type &&
+						$3 == "inet" && $4 == table { print $5 }
+					' "$nftStopFile" | sort -u)"
+					for i in $objects; do
+						grep -qwF "$i" "$nftNetifdFile" 2>/dev/null && continue
+						printf '%s\n' "$live" | awk -v type="$type" -v name="$i" '
+							$1 == type && $2 == name { found=1 }
+							END { exit !found }
+						' || continue
+						nft_call delete "$type" inet "$nftTable" "$i" || result=1
+					done
+				done
+				[ "$result" = '0' ] || return 1
+			;;
 			rt_tables)
 				# shellcheck disable=SC2013
 				for i in $(grep -oh "${ipTablePrefix}_.*" "$rtTablesFile"); do
@@ -1291,24 +1325,6 @@ cleanup() {
 					ip -6 rule del priority "$prio" 2>/dev/null
 				done
 				ip -6 rule del lookup 'main' suppress_prefixlength "$prefixlength" 2>/dev/null
-			;;
-			main_chains)
-				for i in $chainsList dstnat; do
-					i="$(str_to_lower "$i")"
-					nft_call flush chain inet "$nftTable" "${i}"
-				done
-			;;
-			marking_chains)
-				for i in $(get_mark_nft_chains); do
-				#	nft_call flush chain inet "$nftTable" "$i"
-					nft_call delete chain inet "$nftTable" "$i"
-				done
-			;;
-			sets)
-				for i in $(get_nft_sets); do
-				#	nft_call flush set inet "$nftTable" "$i"
-					nft_call delete set inet "$nftTable" "$i"
-				done
 			;;
 		esac
 	done
@@ -2881,6 +2897,13 @@ start_service() {
 
 	json init
 	load_package_config "$param"
+	# rc.common implements reload through start when no reload_service exists.
+	# Disabling the configuration must withdraw the previously installed policy.
+	[ -n "$enabled" ] || { stop_service; return $?; }
+	# Retry an interrupted withdrawal before create:main can replace its record.
+	if [ -s "$nftStopFile" ]; then
+		stop_service || return 1
+	fi
 
 	trap 'enable_forward' EXIT
 
@@ -2966,6 +2989,15 @@ start_service() {
 	fi
 
 	stop_forward
+	if [ "$serviceStartTrigger" != 'on_interface_reload' ]; then
+		# Full rebuilds have the same ownership boundary as stop. Withdraw the
+		# previous include before replacing it; names alone do not prove ownership.
+		rm -f "$packageLockFile"
+		if ! nft_file 'uninstall' 'main'; then
+			serviceStopResult=1
+			return 1
+		fi
+	fi
 
 	procd_open_instance 'main'
 	procd_set_param command /bin/true
@@ -2986,7 +3018,7 @@ start_service() {
 		on_reload|on_start|*)
 			resolver 'store_hash'
 			resolver 'configure'
-			cleanup 'main_table' 'rt_tables' 'main_chains' 'sets'
+			cleanup 'main_table' 'rt_tables'
 			nft_file 'create' 'main'
 			output 1 'Processing interfaces '
 			json_add_array 'gateways'
@@ -3066,6 +3098,8 @@ service_started() {
 	local error warning c
 	enable_forward
 	trap - EXIT
+	[ "$serviceStopResult" = '0' ] || return "$serviceStopResult"
+	[ -n "$enabled" ] || return 0
 	[ -n "$pbrBootFlag" ] && return 0
 	if nft_file 'exists' 'main'; then
 		resolver 'compare_hash' && resolver 'restart'
@@ -3101,7 +3135,10 @@ service_started() {
 		return 0
 	fi
 }
-service_stopped() { procd_set_config_changed firewall; }
+service_stopped() {
+	procd_set_config_changed firewall || return 1
+	return "$serviceStopResult"
+}
 
 service_triggers() {
 	local n
@@ -3153,8 +3190,10 @@ service_triggers() {
 
 stop_service() {
 	local i nft_file_mode
+	serviceStopResult=0
 	json init
-	! is_service_running && [ "$(get_rt_tables_next_id)" = "$(get_rt_tables_non_pbr_next_id)" ] && return 0
+	! is_service_running && ! nft_file 'exists' 'main' && [ ! -s "$nftStopFile" ] && \
+		[ "$(get_rt_tables_next_id)" = "$(get_rt_tables_non_pbr_next_id)" ] && return 0
 	rm -f "$packageLockFile"
 	[ "$1" = 'quiet' ] && quiet_mode 'on'
 	load_environment 'on_stop'
@@ -3162,12 +3201,17 @@ stop_service() {
 		nft_file_mode=1
 	fi
 	output 'Resetting routing '
-	if nft_file 'delete' 'main' && \
-		cleanup 'main_table' 'rt_tables' && \
+	if ! nft_file 'uninstall' 'main'; then
+		output_failn
+		serviceStopResult=1
+		return 1
+	fi
+	if cleanup 'main_table' 'rt_tables' && \
 		ip route flush cache; then
 		output_okn
 	else
 		output_failn
+		serviceStopResult=1
 	fi
 	unset ifaceMark
 	unset ifaceTableID
@@ -3176,23 +3220,25 @@ stop_service() {
 		output_okn
 	else
 		output_failn
+		serviceStopResult=1
 	fi
 	resolver 'compare_hash' && resolver 'restart'
 
-	if [ -n "$enabled" ]; then
+	if [ -n "$enabled" ] && [ "$serviceStopResult" = '0' ]; then
 		if [ -n "$nft_file_mode" ]; then
 			output "$serviceName (fw4 nft file mode) stopped "; output_okn;
 		else
 			output "$serviceName (nft mode) stopped "; output_okn;
 		fi
 	fi
+	return "$serviceStopResult"
 }
 
 restart() {
 	load_package_config 'on_restart'
 	trap 'enable_forward' EXIT
 	stop_forward
-	stop
+	stop || return 1
 	# it takes time before routes are cleaned up, if started immediately a leak can occur
 	[ -n "$strict_enforcement" ] && sleep 2
 	start
