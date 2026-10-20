@@ -68,6 +68,19 @@ ERRFILE="$ddns_rundir/$SECTION_ID.err"	# save stderr output of WGet and other ex
 IPFILE="$ddns_rundir/$SECTION_ID.ip"	#
 LOGFILE="$ddns_logdir/$SECTION_ID.log"	# log file
 
+# Procd owns replacement and termination of managed sections. A direct run
+# must not compete with an existing instance or stop its own supervisor.
+[ -n "$jsonfilter" ] || usage_err "jsonfilter is required to check service ownership"
+DDNS_SERVICE_INFO=$(ubus call service list '{"name":"ddns"}') ||
+	usage_err "Unable to check DDNS service ownership"
+DDNS_INSTANCE=$("$jsonfilter" -s "$DDNS_SERVICE_INFO" -e "@.ddns.instances['$SECTION_ID']")
+if [ -n "$DDNS_INSTANCE" ]; then
+	DDNS_SERVICE_PID=$("$jsonfilter" -s "$DDNS_INSTANCE" -e '@.pid')
+	[ "$DDNS_SERVICE_PID" = "$$" ] ||
+		usage_err "Service section '$SECTION_ID' is managed by procd; stop it with /etc/init.d/ddns stop $SECTION_ID before a direct run"
+fi
+unset DDNS_SERVICE_INFO DDNS_INSTANCE DDNS_SERVICE_PID
+
 # VERBOSE > 1 delete logfile if exist to create an empty one
 # only with this data of this run for easier diagnostic
 # new one created by write_log function
@@ -263,10 +276,8 @@ write_log 7 "force interval: $FORCE_SECONDS seconds"
 write_log 7 "retry interval: $RETRY_SECONDS seconds"
 write_log 7 "retry max count : $retry_max_count times"
 
-# kill old process if it exists & set new pid file
-stop_section_processes "$SECTION_ID"
-[ $? -gt 0 ] && write_log 7 "'SIGTERM' was send to old process" || write_log 7 "No old process"
-echo $$ > $PIDFILE
+# Publish status for LuCI; procd remains the process owner.
+printf '%s\n' "$$" > "$PIDFILE" || write_log 14 "Unable to write PID file '$PIDFILE'"
 
 # determine when the last update was
 # the following lines should prevent multiple updates if hotplug fires multiple startups
