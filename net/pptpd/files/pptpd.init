@@ -6,7 +6,8 @@ USE_PROCD=1
 
 BIN=/usr/sbin/pptpd
 CONFIG=/var/etc/pptpd.conf
-CHAP_SECRETS=/var/etc/chap-secrets
+RUN_D=/var/etc/pptpd
+CHAP_SECRETS=$RUN_D/chap-secrets
 OPTIONS_PPTP=/var/etc/options.pptpd
 
 pptpd_mppe_options() {
@@ -56,19 +57,6 @@ validate_pptpd_section() {
 		'logwtmp:bool:0'
 }
 
-setup_login() {
-	[ "$2" = 0 ] || {
-		echo "validation failed"
-		return 1
-	}
-
-	[ -n "$username" ] || return 0
-	[ -n "$password" ] || return 0
-	[ -n "$remoteip" ] || remoteip=*
-
-	echo "$username pptp-server $password $remoteip" >> $CHAP_SECRETS
-}
-
 setup_config() {
 	[ "$2" = 0 ] || {
 		echo "validation failed"
@@ -78,28 +66,48 @@ setup_config() {
 	[ "$enabled" -eq 0 ] && return 1
 
 	mkdir -p /var/etc
-	cp /etc/pptpd.conf $CONFIG
-	cp /etc/ppp/options.pptpd $OPTIONS_PPTP
+	cp /etc/pptpd.conf "$next_config" || return 1
+	cp /etc/ppp/options.pptpd "$next_options" || return 1
 
-	[ -n "$localip" ] && echo "localip  $localip" >> $CONFIG
-	[ -n "$remoteip" ] && echo "remoteip  $remoteip" >> $CONFIG
-	[ "$logwtmp" -eq 1 ] && echo "logwtmp" >> $CONFIG
+	[ -n "$localip" ] && echo "localip  $localip" >> "$next_config"
+	[ -n "$remoteip" ] && echo "remoteip  $remoteip" >> "$next_config"
+	[ "$logwtmp" -eq 1 ] && echo "logwtmp" >> "$next_config"
 
-	pptpd_mppe_options "$mppe" >> "$OPTIONS_PPTP" || return 1
+	pptpd_mppe_options "$mppe" >> "$next_options" || return 1
+	printf 'chap-secrets "%s"\n' "$CHAP_SECRETS" >> "$next_options"
 
 	return 0
 }
 
 start_service() {
+	local enabled stage next_config next_options
 	config_load pptpd
-	validate_pptpd_section pptpd setup_config || return
-	sed -i -E "/^\w+\s+pptp-server\s+.+$/d" $CHAP_SECRETS
-	config_foreach validate_login_section login setup_login
-
-	ln -sfn $CHAP_SECRETS /etc/ppp/chap-secrets
+	config_get_bool enabled pptpd enabled 1
+	[ "$enabled" = 1 ] || return
+	umask 077
+	mkdir -p "$RUN_D" || exit 1
+	chmod 0700 "$RUN_D" || exit 1
+	stage="$(mktemp -d "$RUN_D/config.XXXXXX")" || exit 1
+	next_config="$stage/pptpd.conf"
+	next_options="$stage/options.pptpd"
+	ucode /usr/share/pptpd/credentials.uc "$stage" &&
+		validate_pptpd_section pptpd setup_config || {
+		rm -rf "$stage"
+		exit 1
+	}
+	mv -f "$stage/chap-secrets" "$CHAP_SECRETS" &&
+		mv -f "$next_options" "$OPTIONS_PPTP" &&
+		mv -f "$next_config" "$CONFIG" || {
+		rm -rf "$stage"
+		exit 1
+	}
+	rmdir "$stage"
 
 	procd_open_instance
-	procd_set_param command $BIN -c $CONFIG --fg -o $OPTIONS_PPTP
+	procd_set_param command $BIN -c $CONFIG --fg -o $OPTIONS_PPTP -p /var/run/pptpd.pid
+	procd_set_param file "$CONFIG" "$OPTIONS_PPTP" "$CHAP_SECRETS"
+	procd_set_param term_timeout 15
+	procd_set_param respawn
 	procd_close_instance
 }
 
