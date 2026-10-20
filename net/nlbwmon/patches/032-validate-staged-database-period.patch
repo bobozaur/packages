@@ -1,0 +1,125 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] Validate stored periods without starting the accounting daemon
+
+Expose the existing complete read-only database parser before daemon setup.
+Archive consumers can validate staged historical periods before retiring an
+active writer or replacing its immutable snapshots.
+Inspect each gzip read's status before another read can clear a truncated
+member error, even when the requested bytes were returned in full.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/nlbwmon.c
++++ b/nlbwmon.c
+@@ -232,10 +232,13 @@
+ 		{ .cb = request_shutdown, .signo = SIGUSR1 },
+ 	};
+ 	uint32_t timestamp;
++	uint32_t check_timestamp = 0;
++	unsigned long value;
++	bool check_only = false;
+ 	int optchr, err, i;
+ 	char *e;
+ 
+-	while ((optchr = getopt(argc, argv, "b:i:r:s:o:p:G:I:L:PZ")) > -1) {
++	while ((optchr = getopt(argc, argv, "b:i:r:s:o:p:G:I:L:PZV:")) > -1) {
+ 		switch (optchr) {
+ 		case 'b':
+ 			opt.netlink_buffer_size = (int)strtol(optarg, &e, 0);
+@@ -313,7 +316,31 @@
+ 		case 'Z':
+ 			opt.db.compress = true;
+ 			break;
++
++		case 'V':
++			errno = 0;
++			value = strtoul(optarg, &e, 10);
++			if (optarg[0] < '0' || optarg[0] > '9' || *e ||
++			    errno || value > UINT32_MAX) {
++				fprintf(stderr, "Invalid database period: %s\n", optarg);
++				return 1;
++			}
++			check_timestamp = value;
++			check_only = true;
++			break;
++
++		default:
++			return 1;
+ 		}
++	}
++
++	/* Validate an archive without starting an owner or changing stored data. */
++	if (check_only) {
++		err = database_load(NULL, opt.db.directory, check_timestamp);
++		if (err)
++			fprintf(stderr, "Unable to validate database %u: %s\n",
++			        check_timestamp, strerror(-err));
++		return err ? 1 : 0;
+ 	}
+ 
+ 	if (!opt.archive_interval.type) {
+--- a/README.md
++++ b/README.md
+@@ -33,6 +33,11 @@
+ 
+ <dt>-o /path/to/database-folder</dt>
+ <dd>Storage directory for the database files.</dd>
++
++<dt>-V YYYYMMDD</dt>
++<dd>Validate the specified stored period in the directory selected by -o and
++exit. This uses the database loader without starting the daemon or modifying
++database files. A nonzero exit status reports missing or invalid input.</dd>
+ 
+ <dt>-p /path/to/protocol-file</dt>
+ <dd>Protocol description file, used to distinguish traffic streams by IP protocol number and port.</dd>
+--- a/database.c
++++ b/database.c
+@@ -453,6 +453,20 @@
+ }
+ 
+ static int
++database_gzread(gzFile gz, void *buf, int size)
++{
++	int len, zerr;
++
++	len = gzread(gz, buf, size);
++	/* A full read can report a truncated member. The next read may clear
++	 * Z_BUF_ERROR, so inspect it before consuming any more input. */
++	gzerror(gz, &zerr);
++	if (zerr != Z_OK || len < 0)
++		return zerr == Z_ERRNO && errno ? -errno : -EIO;
++	return len == size ? 0 : -ERANGE;
++}
++
++static int
+ database_restore_gzip(struct dbhandle *h, const char *path, uint32_t timestamp)
+ {
+ 	struct database hdr;
+@@ -464,10 +478,9 @@
+ 	gz = gzopen(path, "rb");
+ 	if (!gz)
+ 		return -errno;
+-	if (gzread(gz, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+-		err = -ERANGE;
+-		goto out;
+-	}
++	err = database_gzread(gz, &hdr, sizeof(hdr));
++	if (err)
++		goto out;
+ 	if (be32toh(hdr.magic) != MAGIC || hdr.interval.type == 0 ||
+ 	    db_timestamp(&hdr) != timestamp) {
+ 		err = -EINVAL;
+@@ -478,10 +491,9 @@
+ 	/* Even with a smaller configured limit, consume and validate the whole
+ 	 * archive. Only the selected records need storage in the staged handle. */
+ 	for (i = 0; i < entries; i++) {
+-		if (gzread(gz, &rec, db_recsize) != db_recsize) {
+-			err = -ERANGE;
++		err = database_gzread(gz, &rec, db_recsize);
++		if (err)
+ 			goto out;
+-		}
+ 		if (h && (!h->limit || i < h->limit)) {
+ 			err = database_insert(h, &rec);
+ 			if (err)
