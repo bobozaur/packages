@@ -1,0 +1,2579 @@
+Subject: [PATCH] agent: support standalone backhaul STA radio ownership
+
+Read optional AP and STA endpoints from the existing stock UCI radio sections.
+Resolve a standalone STA's stable RUID and AP capabilities from the actual
+physical device and permanent MAC, without creating an AP interface. Retain
+per-radio M1 and accept only authenticated Controller TearDown for its zero-BSS
+policy; an AP request remains a policy failure in the existing retry state.
+
+Keep AP managers and monitors attached only to real AP endpoints. Route STA
+onboarding, recovery and WPS through the existing backhaul owner, and decline
+AP channel/scan operations on the dedicated uplink. Preserve ordinary AP-only
+and AP+STA APIs and native UCI/supplicant ownership.
+
+--- a/agent/src/beerocks/slave/agent_db.cpp
++++ b/agent/src/beerocks/slave/agent_db.cpp
+@@ -10,8 +10,139 @@
+ 
+ #include <bpl/bpl_cfg.h>
+ #include <easylogging++.h>
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++#include <bwl/nl80211_client_factory.h>
++#include <linux/nl80211.h>
++#endif
+ 
+ namespace beerocks {
++
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++bool AgentDB::refresh_sta_only_radio(AgentDB::sRadio &target)
++{
++    if (target.has_ap() || target.back.iface_name.empty()) return false;
++    auto updated = target;
++    auto &radio = updated;
++    auto client = bwl::nl80211_client_factory::create_instance();
++    bwl::nl80211_client::interface_info iface{};
++    std::vector<bwl::nl80211_client::physical_radio> phys;
++    if (!client || !client->get_interface_info(radio.back.iface_name, iface) ||
++        iface.name != radio.back.iface_name || !iface.index ||
++        iface.addr == net::network_utils::ZERO_MAC || (iface.addr.oct[0] & 1) ||
++        iface.type != NL80211_IFTYPE_STATION || !client->get_physical_radios(phys)) return false;
++    auto sta = std::find_if(phys.begin(), phys.end(), [&](const auto &p) {
++        return p.index == iface.wiphy;
++    });
++    if (sta == phys.end() || sta->device_path.empty() ||
++        sta->permanent_mac == net::network_utils::ZERO_MAC ||
++        (sta->permanent_mac.oct[0] & 1)) return false;
++    const bwl::nl80211_client::physical_radio *ap = nullptr;
++    for (const auto &phy : phys) {
++        if (!phy.supports_ap || !phy.max_ap_interfaces ||
++            phy.device_path != sta->device_path || phy.permanent_mac != sta->permanent_mac) continue;
++        if (ap) return false; // Ambiguous physical identity is not a radio pairing.
++        ap = &phy;
++    }
++    bwl::nl80211_client::radio_info info;
++    if (!ap || !client->get_radio_info_by_phy(ap->index, info)) return false;
++    auto band = info.bands.end();
++    const auto current_band = son::wireless_utils::which_freq_type(iface.frequency);
++    for (auto it = info.bands.begin(); it != info.bands.end(); ++it) {
++        if (it->supported_channels.empty()) continue;
++        if (current_band != eFreqType::FREQ_UNKNOWN && it->get_frequency_band() != current_band) continue;
++        if (band != info.bands.end()) return false; // Need an unambiguous operating band.
++        band = it;
++    }
++    if (band == info.bands.end() ||
++        (band->ht_supported && !band->ht_mcs_valid) ||
++        (band->vht_supported && !band->vht_mcs_valid) ||
++        (band->he_supported && (!band->he_mcs_valid || !band->he_data_valid))) return false;
++    if (target.radio_uid() != net::network_utils::ZERO_MAC &&
++        (target.radio_uid() != sta->permanent_mac || target.physical_device_path != sta->device_path))
++        return false;
++    for (const auto *other : get_radios_list()) {
++        if (other == &target) continue;
++        if (other->radio_uid() != net::network_utils::ZERO_MAC &&
++            other->radio_uid() == sta->permanent_mac) return false;
++        if (!other->has_ap()) continue;
++        bwl::nl80211_client::interface_info endpoint{};
++        if (!client->get_interface_info(other->front.iface_name, endpoint) ||
++            endpoint.name != other->front.iface_name || endpoint.type != NL80211_IFTYPE_AP) return false;
++        const auto owner = std::find_if(phys.begin(), phys.end(), [&](const auto &p) {
++            return p.index == endpoint.wiphy;
++        });
++        if (owner == phys.end() || (owner->device_path == sta->device_path &&
++            owner->permanent_mac == sta->permanent_mac)) return false;
++    }
++    radio.front.iface_mac = sta->permanent_mac; // Protocol RUID, not an operating AP/BSSID.
++    radio.back.iface_mac = iface.addr;
++    radio.capability_band = band->get_frequency_band();
++    if (radio.capability_band == eFreqType::FREQ_UNKNOWN) return false;
++    radio.capability_phy = ap->name;
++    radio.physical_device_path = sta->device_path;
++    if (!bpl::bpl_cfg_sta_only_radio_quiet(radio.back.iface_name, ap->name, radio.wireless_device)) return false;
++    radio.front.radio_max_bss = std::min<uint32_t>(ap->max_ap_interfaces, radio.front.bssids.size());
++    radio.front.zwdfs = false;
++    radio.front.hybrid_mode_supported = false;
++    radio.front.max_supported_bw = band->get_max_bandwidth();
++    radio.max_supported_bw = band->get_max_bandwidth();
++    radio.number_of_antennas = 0;
++    radio.antenna_gain_dB = 0;
++    radio.tx_power_dB = 0;
++    if (iface.frequency) {
++        uint32_t power = UINT32_MAX;
++        if (!client->get_tx_power_dbm(radio.back.iface_name, power) || power > UINT8_MAX) return false;
++        radio.tx_power_dB = power;
++    }
++    radio.sta_iface_filter_low = false;
++    radio.ht_supported = band->ht_supported;
++    radio.vht_supported = band->vht_supported;
++    if (!band->get_multi_ap_ht_capability(radio.ht_capability) ||
++        !band->get_multi_ap_vht_capability(radio.vht_capability)) return false;
++    std::copy_n(band->ht_mcs_set, radio.ht_mcs_set.size(), radio.ht_mcs_set.begin());
++    std::copy_n(band->vht_mcs_set, radio.vht_mcs_set.size(), radio.vht_mcs_set.begin());
++    radio.he_supported = band->he_supported;
++    radio.he_capability = band->he_capability;
++    if (radio.he_supported) {
++        const auto rx = band->mcs_map_nss(band->he_mcs_set),
++                   tx = band->mcs_map_nss(band->he_mcs_set + 2);
++        if (!rx || !tx) return false;
++        auto &he = *reinterpret_cast<net::sHECapabilities *>(&radio.he_capability);
++        he.max_num_of_supported_rx_spatial_streams = rx - 1;
++        he.max_num_of_supported_tx_spatial_streams = tx - 1;
++    }
++    radio.wifi6_capability = band->wifi6_capability;
++    std::copy_n(band->he_mcs_set, radio.he_mcs_set.size(), radio.he_mcs_set.begin());
++    radio.supported_standards = radio.he_supported ? "ax" : radio.vht_supported ? "ac" : "n";
++    radio.channels_list.clear();
++    for (const auto &entry : band->supported_channels) {
++        const auto &channel = entry.second;
++        auto &out = radio.channels_list[entry.first];
++        out.tx_power_dbm = channel.tx_power;
++        out.dfs_state = channel.is_dfs ? channel.dfs_state : beerocks_message::eDfsState::DFS_STATE_MAX;
++        for (auto width : channel.supported_bandwidths) {
++            beerocks_message::sSupportedBandwidth bw{};
++            bw.bandwidth = width;
++            bw.rank = 1;
++            bw.multiap_preference = 14;
++            out.supported_bw_list.push_back(bw);
++        }
++    }
++    radio.wifi_channel = WifiChannel();
++    if (iface.frequency) {
++        if (iface.frequency_center2 || (iface.bandwidth != 20 && iface.bandwidth != 40 &&
++            iface.bandwidth != 80 && iface.bandwidth != 160)) return false;
++        eWiFiBandwidth width = eWiFiBandwidth::BANDWIDTH_20;
++        if (iface.bandwidth == 40) width = eWiFiBandwidth::BANDWIDTH_40;
++        else if (iface.bandwidth == 80) width = eWiFiBandwidth::BANDWIDTH_80;
++        else if (iface.bandwidth == 160) width = eWiFiBandwidth::BANDWIDTH_160;
++        radio.wifi_channel = WifiChannel(iface.channel, radio.capability_band, width);
++    }
++    if (!radio.front.radio_max_bss) return false;
++    target = std::move(updated);
++    return true;
++}
++#endif
+ 
+ AgentDB::sRadio *AgentDB::radio(const std::string &iface_name)
+ {
+--- a/agent/src/beerocks/slave/agent_db.h
++++ b/agent/src/beerocks/slave/agent_db.h
+@@ -275,6 +275,15 @@
+         {
+         }
+ 
++        bool has_ap() const { return !front.iface_name.empty(); }
++        const std::string &iface_name() const
++        {
++            return has_ap() ? front.iface_name : back.iface_name;
++        }
++        // Legacy storage is also the protocol radio UID. An empty AP endpoint
++        // never implies that this UID is an operating BSSID.
++        const sMacAddr &radio_uid() const { return front.iface_mac; }
++
+         struct sFront {
+             explicit sFront(const std::string &iface_name_)
+                 : iface_name(iface_name_), iface_mac(net::network_utils::ZERO_MAC)
+@@ -396,6 +405,15 @@
+          * @brief The channel of the radio
+          */
+         beerocks::WifiChannel wifi_channel;
++        eFreqType capability_band = eFreqType::FREQ_UNKNOWN;
++        std::string capability_phy;
++        std::string physical_device_path;
++        std::string wireless_device;
++        eFreqType frequency_band() const
++        {
++            auto band = wifi_channel.get_freq_type();
++            return band == eFreqType::FREQ_UNKNOWN ? capability_band : band;
++        }
+ 
+         eWiFiBandwidth max_supported_bw = eWiFiBandwidth::BANDWIDTH_UNKNOWN;
+         std::string supported_standards; ///< Hardware-supported IEEE 802.11 standards
+@@ -445,6 +463,10 @@
+ 
+         std::string chipset_vendor;
+     };
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    bool refresh_sta_only_radio(sRadio &radio);
++#endif
++
+     struct {
+         uint16_t max_number_of_vlans_ids;
+         // Key: SSID, Value: VID
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.cpp
+@@ -377,6 +377,7 @@
+ 
+ void BackhaulManager::on_thread_stop()
+ {
++    cancel_backhaul_steering_operation();
+     m_topology_task_initialized = false;
+     stop_fdb_monitor();
+ 
+@@ -389,10 +390,10 @@
+         if (radio_info) {
+             LOG(DEBUG) << "Closing interface " << radio_info->sta_iface << " bwl";
+ 
++            clear_radio_handlers(radio_info);
+             if (radio_info->sta_wlan_hal) {
+                 radio_info->sta_wlan_hal.reset();
+             }
+-            clear_radio_handlers(radio_info);
+         }
+         m_radios_info.pop_back();
+     }
+@@ -495,7 +496,7 @@
+             radio = db->radio(radio_info->hostap_iface);
+         }
+         if (radio) {
+-            iface_info.wireless_freq_type = radio->wifi_channel.get_freq_type();
++            iface_info.wireless_freq_type = radio->frequency_band();
+         }
+         iface_info.selected_backhaul =
+             db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wireless &&
+@@ -677,7 +678,7 @@
+     for (auto preferred_freq : {beerocks::FREQ_24G, beerocks::FREQ_5G, beerocks::FREQ_6G}) {
+         for (const auto &radio : db->get_radios_list()) {
+             if (!radio || radio->front.iface_name.empty() ||
+-                radio->wifi_channel.get_freq_type() != preferred_freq) {
++                radio->frequency_band() != preferred_freq) {
+                 continue;
+             }
+ 
+@@ -717,15 +718,15 @@
+ 
+     ieee1905_1::tlvAutoconfigFreqBand::eValue freq_band =
+         ieee1905_1::tlvAutoconfigFreqBand::IEEE_802_11_2_4_GHZ;
+-    if (radio->wifi_channel.get_freq_type() == beerocks::eFreqType::FREQ_24G) {
++    if (radio->frequency_band() == beerocks::eFreqType::FREQ_24G) {
+         freq_band = ieee1905_1::tlvAutoconfigFreqBand::IEEE_802_11_2_4_GHZ;
+-    } else if (radio->wifi_channel.get_freq_type() == beerocks::eFreqType::FREQ_5G) {
++    } else if (radio->frequency_band() == beerocks::eFreqType::FREQ_5G) {
+         freq_band = ieee1905_1::tlvAutoconfigFreqBand::IEEE_802_11_5_GHZ;
+-    } else if (radio->wifi_channel.get_freq_type() == beerocks::eFreqType::FREQ_6G) {
++    } else if (radio->frequency_band() == beerocks::eFreqType::FREQ_6G) {
+         freq_band = ieee1905_1::tlvAutoconfigFreqBand::IEEE_802_11_6_GHZ;
+     } else {
+         LOG(DEBUG) << "Skipping wired controller probe on unsupported radio freq_type="
+-                   << int(radio->wifi_channel.get_freq_type()) << ", iface=" << radio_iface;
++                   << int(radio->frequency_band()) << ", iface=" << radio_iface;
+         return false;
+     }
+ 
+@@ -1854,6 +1855,25 @@
+     }
+     // Backhaul manager is OPERATIONAL!
+     case EState::OPERATIONAL: {
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++        auto db = AgentDB::get();
++        if (db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wireless) {
++            auto radio = db->radio(db->backhaul.selected_iface_name);
++            if (!radio || !radio->has_ap()) {
++                auto hal = get_wireless_hal(db->backhaul.selected_iface_name);
++                const auto now = std::chrono::steady_clock::now();
++                if (!radio || !hal || hal->get_state() == bwl::HALState::Failed ||
++                    (now >= m_next_sta_control_probe && !hal->ping())) {
++                    LOG(ERROR) << "Selected STA control owner failed; retiring through RESTART";
++                    FSM_MOVE_STATE(RESTART);
++                    break;
++                }
++                if (now >= m_next_sta_control_probe) {
++                    m_next_sta_control_probe = now + std::chrono::seconds(5);
++                }
++            }
++        }
++#endif
+         // If the agent is operational through wireless backhaul, keep looking for a wired
+         // controller path at a low rate. This lets a later cable plug-in move the agent back to
+         // preferred wired onboarding without interrupting the current wireless connection first.
+@@ -1903,6 +1923,11 @@
+ 
+         LOG(DEBUG) << "Restarting ...";
+ 
++        cancel_backhaul_steering_operation();
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++        m_next_sta_control_probe = {};
++#endif
++
+         if (m_remove_platform_manager_client) {
+             m_platform_manager_client.reset();
+             m_remove_platform_manager_client = false;
+@@ -1911,12 +1936,10 @@
+ 
+         for (auto &radio_info : m_radios_info) {
+             auto radio = db->radio(radio_info->sta_iface);
+-            if (!radio) {
+-                continue;
+-            }
+-            // Clear the backhaul interface mac.
+-            radio->back.iface_mac = beerocks::net::network_utils::ZERO_MAC;
+-
++            if (radio) {
++                // Clear the backhaul interface mac without retaining its old control owner.
++                radio->back.iface_mac = beerocks::net::network_utils::ZERO_MAC;
++            }
+             clear_radio_handlers(radio_info);
+ 
+             if (radio_info->sta_wlan_hal) {
+@@ -2150,7 +2173,8 @@
+                     tlvf::mac_from_string(radio_info->sta_wlan_hal->get_wireless_backhaul_mac());
+ 
+             } else if (attach_state == bwl::HALState::Failed) {
+-                // Delete the HAL instance
++                clear_radio_handlers(radio_info);
++                // Delete the HAL instance only after unregistering its descriptors.
+                 radio_info->sta_wlan_hal.reset();
+                 success = false;
+                 break;
+@@ -2258,12 +2282,12 @@
+                     LOG(WARNING) << "Sta_hal of " << radios_info->sta_iface << " is null";
+                     continue;
+                 }
+-                auto radio = db->radio(radios_info->hostap_iface);
++                auto radio = db->radio(radios_info->sta_iface.empty() ? radios_info->hostap_iface : radios_info->sta_iface);
+                 if (!radio) {
+                     continue;
+                 }
+                 if (db->device_conf.back_radio.backhaul_preferred_radio_band ==
+-                    radio->wifi_channel.get_freq_type()) {
++                    radio->frequency_band()) {
+                     preferred_band_is_available = true;
+                 }
+             }
+@@ -2283,7 +2307,7 @@
+                 continue;
+             }
+ 
+-            auto radio = db->radio(radios_info->hostap_iface);
++            auto radio = db->radio(radios_info->sta_iface.empty() ? radios_info->hostap_iface : radios_info->sta_iface);
+             if (!radio) {
+                 continue;
+             }
+@@ -2292,7 +2316,7 @@
+                 db->device_conf.back_radio.backhaul_preferred_radio_band !=
+                     beerocks::eFreqType::FREQ_AUTO &&
+                 db->device_conf.back_radio.backhaul_preferred_radio_band !=
+-                    radio->wifi_channel.get_freq_type()) {
++                    radio->frequency_band()) {
+                 LOG(DEBUG) << "slave iface=" << radios_info->sta_iface
+                            << " is not of the preferred backhaul band";
+                 continue;
+@@ -3053,6 +3077,7 @@
+     auto iface_hal = get_wireless_hal();
+     auto db        = AgentDB::get();
+     for (const auto &radio_info : m_radios_info) {
++        if (radio_info->hostap_iface.empty()) continue;
+         auto notification =
+             message_com::create_vs_message<beerocks_message::cACTION_BACKHAUL_ENABLE_APS_REQUEST>(
+                 cmdu_tx);
+@@ -3175,6 +3200,15 @@
+                    << " on channel=" << (iface_hal->get_channel()) << " on iface=" << iface;
+ 
+         auto db = AgentDB::get();
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++        auto radio = db->radio(iface);
++        if (radio && !radio->has_ap() &&
++            (!db->refresh_sta_only_radio(*radio) || !radio->wifi_channel.get_channel())) {
++            LOG(ERROR) << "Standalone STA physical identity, capabilities or no-AP policy changed";
++            FSM_MOVE_STATE(RESTART);
++            return false;
++        }
++#endif
+         if (db->device_conf.certification_mode) {
+             /* When the station is connected we wanted to enable
+                3addr multicast packets entering the system.
+@@ -3203,8 +3237,7 @@
+         if ((m_backhaul_steering_bssid != beerocks::net::network_utils::ZERO_MAC) &&
+             (m_backhaul_steering_bssid == bssid)) {
+ 
+-            m_backhaul_steering_bssid = beerocks::net::network_utils::ZERO_MAC;
+-            m_timer_manager->remove_timer(m_backhaul_steering_timer);
++            cancel_backhaul_steering_operation();
+ 
+             if (!create_backhaul_steering_response(wfa_map::tlvErrorCode::eReasonCode::RESERVED,
+                                                    bssid)) {
+@@ -3492,7 +3525,23 @@
+     } break;
+ 
+     case Event::ChannelSwitch: {
+-
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++        auto db = AgentDB::get();
++        auto radio = db->radio(iface);
++        if (radio && !radio->has_ap() &&
++            db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wireless &&
++            iface == db->backhaul.selected_iface_name) {
++            auto hal = get_wireless_hal(iface);
++            if (!hal || !hal->update_status() || !db->refresh_sta_only_radio(*radio) ||
++                !radio->wifi_channel.get_channel()) {
++                LOG(ERROR) << "Cannot refresh dedicated STA after native channel switch";
++                FSM_MOVE_STATE(RESTART);
++                return false;
++            }
++            m_task_pool.send_event(eTaskType::CHANNEL_SELECTION,
++                                   ChannelSelectionTask::eEvent::STA_CHANNEL_SWITCH, &iface);
++        }
++#endif
+     } break;
+ 
+     case Event::STA_Unassoc_RSSI: {
+@@ -4172,7 +4221,10 @@
+     m_backhaul_steering_bssid   = beerocks::net::network_utils::ZERO_MAC;
+     m_backhaul_steering_channel = {0, eFreqType::FREQ_UNKNOWN};
+ 
+-    m_timer_manager->remove_timer(m_backhaul_steering_timer);
++    if (m_backhaul_steering_timer != beerocks::net::FileDescriptor::invalid_descriptor) {
++        m_timer_manager->remove_timer(m_backhaul_steering_timer);
++        m_backhaul_steering_timer = beerocks::net::FileDescriptor::invalid_descriptor;
++    }
+ }
+ 
+ std::string BackhaulManager::freq_to_radio_mac(eFreqType freq) const
+@@ -4182,8 +4234,8 @@
+         if (!radio) {
+             continue;
+         }
+-        if (radio->wifi_channel.get_freq_type() == freq) {
+-            return tlvf::mac_to_string(radio->front.iface_mac);
++        if (!radio->back.iface_name.empty() && radio->frequency_band() == freq) {
++            return tlvf::mac_to_string(radio->radio_uid());
+         }
+     }
+ 
+@@ -4204,6 +4256,7 @@
+ 
+     // Store the socket to the slave managing the requested radio
+     auto &radio_info = *it;
++    if (radio_info->hostap_iface.empty()) return false;
+     // WPS PBC registration on AP interface
+     auto msg =
+         message_com::create_vs_message<beerocks_message::cACTION_BACKHAUL_START_WPS_PBC_REQUEST>(
+@@ -4252,6 +4305,9 @@
+ 
+ bool BackhaulManager::start_wps_pbc(const sMacAddr &radio_mac)
+ {
++    auto db = AgentDB::get();
++    auto radio = db->get_radio_by_mac(radio_mac, AgentDB::eMacType::RADIO);
++    if (radio && !radio->has_ap()) return start_wps_pbc_ep(radio_mac);
+     if (m_eFSMState == EState::OPERATIONAL) {
+         LOG(INFO) << "WPS PBC: AP/fronthaul path (agent is operational)";
+         return start_wps_pbc_ap(radio_mac);
+@@ -4293,7 +4349,7 @@
+         bool result = false;
+         for (const auto radio : db->get_radios_list()) {
+             //Skip 6GHz since WPS is not allowed on 6GHz per Wi-Fi 6E standard
+-            if (!radio || radio->wifi_channel.get_freq_type() == eFreqType::FREQ_6G) {
++            if (!radio || !radio->has_ap() || radio->frequency_band() == eFreqType::FREQ_6G) {
+                 continue;
+             }
+             if (start_wps_pbc_ap(radio->front.iface_mac)) {
+@@ -4336,6 +4392,7 @@
+ 
+     // Store the socket to the slave managing the requested radio
+     const auto &radio_info = *it;
++    if (radio_info->hostap_iface.empty()) return false;
+ 
+     auto msg = message_com::create_vs_message<
+         beerocks_message::cACTION_BACKHAUL_SET_ASSOC_DISALLOW_REQUEST>(cmdu_tx);
+@@ -4693,7 +4750,7 @@
+ 
+     auto db = AgentDB::get();
+     for (const auto radio : db->get_radios_list()) {
+-        if (!radio || radio->front.iface_mac == beerocks::net::network_utils::ZERO_MAC) {
++        if (!radio || !radio->has_ap() || radio->front.iface_mac == beerocks::net::network_utils::ZERO_MAC) {
+             continue;
+         }
+ 
+--- a/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
++++ b/agent/src/beerocks/slave/backhaul_manager/backhaul_manager.h
+@@ -452,6 +452,10 @@
+     bool handle_wired_autoconfiguration_response(uint32_t iface_index,
+                                                  ieee1905_1::CmduMessageRx &cmdu_rx);
+ 
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    std::chrono::steady_clock::time_point m_next_sta_control_probe{};
++#endif
++
+     wan_monitor wan_mon;
+     int m_wan_monitor_fd = beerocks::net::FileDescriptor::invalid_descriptor;
+     // Runtime fallback guard. Set after wired controller discovery timeout and kept across the
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -211,7 +211,8 @@
+ 
+ static void fill_son_slave_config(const beerocks::config_file::sConfigSlave &beerocks_slave_conf,
+                                   beerocks::slave_thread::sAgentConfig &agent_conf,
+-                                  const std::unordered_map<int, std::string> &interfaces_map)
++                                  const std::unordered_map<int, std::string> &interfaces_map,
++                                  const std::vector<beerocks::bpl::BPL_RADIO_IFACES> &inventory)
+ {
+     agent_conf.temp_path = beerocks_slave_conf.temp_path;
+     agent_conf.vendor    = beerocks_slave_conf.vendor;
+@@ -250,6 +251,15 @@
+                 : 0;
+     }
+ 
++    for (const auto &radio : inventory) {
++        if (radio.hostap_iface.empty()) {
++            agent_conf.sta_only_radios.emplace(radio.sta_iface, radio.wireless_device);
++        } else {
++            agent_conf.radios.at(radio.hostap_iface).backhaul_wireless_iface =
++                beerocks::net::network_utils::linux_iface_exists(radio.sta_iface) ? radio.sta_iface : "";
++        }
++    }
++
+     auto db = beerocks::AgentDB::get();
+ 
+     db->device_conf.operating_system = beerocks::os_utils::get_os_name();
+@@ -348,7 +358,8 @@
+ static std::shared_ptr<beerocks::slave_thread>
+ start_agent_thread(const std::unordered_map<int, std::string> &interfaces_map,
+                    const beerocks::config_file::sConfigSlave &beerocks_slave_conf, int argc,
+-                   char *argv[])
++                   char *argv[],
++                   const std::vector<beerocks::bpl::BPL_RADIO_IFACES> &inventory)
+ {
+     std::string base_agent_name(BEEROCKS_AGENT);
+ 
+@@ -361,7 +372,7 @@
+     g_loggers.push_back(logger);
+ 
+     beerocks::slave_thread::sAgentConfig agent_conf;
+-    fill_son_slave_config(beerocks_slave_conf, agent_conf, interfaces_map);
++    fill_son_slave_config(beerocks_slave_conf, agent_conf, interfaces_map, inventory);
+ 
+     auto son_slave = std::make_shared<beerocks::slave_thread>(agent_conf, *logger);
+     if (!son_slave) {
+@@ -581,6 +592,35 @@
+         // Destroy `db` to unlock it.
+     }
+ 
++    std::vector<beerocks::bpl::BPL_RADIO_IFACES> inventory;
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    if (!beerocks::bpl::cfg_get_radio_inventory(inventory)) {
++        LOG(ERROR) << "Invalid physical radio inventory";
++        return 1;
++    }
++    size_t ap_count = 0;
++    for (const auto &radio : inventory) {
++        if (!radio.hostap_iface.empty()) {
++            const auto ap = interfaces_map.find(radio.radio_num);
++            if (ap == interfaces_map.end() || ap->second != radio.hostap_iface) {
++                LOG(ERROR) << "AP inventory differs from committed radio binding";
++                return 1;
++            }
++            ++ap_count;
++        }
++        if (radio.radio_num < 0 || radio.radio_num >= beerocks::MAX_RADIOS_PER_AGENT) {
++            LOG(ERROR) << "Radio index exceeds supported Agent inventory";
++            return 1;
++        }
++        if (radio.hostap_iface.empty())
++            beerocks_slave_conf.sta_iface[radio.radio_num] = radio.sta_iface;
++    }
++    if (ap_count != interfaces_map.size()) {
++        LOG(ERROR) << "AP inventory differs from committed radio binding";
++        return 1;
++    }
++#endif
++
+     beerocks::PlatformManager platform_manager(beerocks_slave_conf, interfaces_map, *agent_logger,
+                                                std::move(platform_manager_cmdu_server),
+                                                timer_manager, event_loop);
+@@ -617,7 +657,7 @@
+         [&backhaul_manager]() -> bool { return backhaul_manager.initiate_wps_pbc_auto(); });
+ #endif //ENABLE_NBAPI
+ 
+-    auto agent = start_agent_thread(interfaces_map, beerocks_slave_conf, argc, argv);
++    auto agent = start_agent_thread(interfaces_map, beerocks_slave_conf, argc, argv, inventory);
+     if (!agent) {
+         LOG(ERROR) << "Failed to start Agent thread";
+         return 1;
+--- a/agent/src/beerocks/slave/platform_manager/platform_manager.cpp
++++ b/agent/src/beerocks/slave/platform_manager/platform_manager.cpp
+@@ -49,6 +49,17 @@
+ //////////////////////////////////////////////////////////////////////////////
+ static std::string get_sta_iface(const std::string &hostap_iface)
+ {
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    std::vector<bpl::BPL_RADIO_IFACES> inventory;
++    if (!bpl::cfg_get_radio_inventory(inventory)) return {};
++    for (const auto &radio : inventory) {
++        if (radio.hostap_iface == hostap_iface) {
++            return net::network_utils::linux_iface_exists(radio.sta_iface) ? radio.sta_iface : "";
++        }
++    }
++    return {};
++#else
++
+     std::string sta_iface;
+     if (bpl::cfg_get_sta_iface(hostap_iface, sta_iface) < 0) {
+         LOG(DEBUG) << "failed to read sta_iface for slave ";
+@@ -59,6 +70,7 @@
+         return std::string();
+     }
+     return sta_iface;
++#endif
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////////
+@@ -208,11 +220,11 @@
+         }
+         load_iface_params(config.bridge_iface, beerocks::ARP_SRC_ETH_FRONT);
+ 
+-        if (db->ethernet.wan.iface_name.empty()) {
+-            LOG(ERROR) << "wan.iface_name is empty!";
+-            return false;
+-        }
+-        load_iface_params(db->ethernet.wan.iface_name, beerocks::ARP_SRC_ETH_BACK);
++        // Wireless-only agents have no wired endpoint. Keep the real bridge and
++        // STA interfaces in the ordinary ARP map without inventing a WAN identity.
++        if (!db->ethernet.wan.iface_name.empty()) {
++            load_iface_params(db->ethernet.wan.iface_name, beerocks::ARP_SRC_ETH_BACK);
++        }
+ 
+         for (int slave_num = 0; slave_num < MAX_RADIOS_PER_AGENT; slave_num++) {
+             if (!config.sta_iface[slave_num].empty()) {
+--- a/agent/src/beerocks/slave/son_slave_thread.cpp
++++ b/agent/src/beerocks/slave/son_slave_thread.cpp
+@@ -197,6 +197,7 @@
+ }
+ #undef EACH_SLAVESTATE
+ 
++
+ slave_thread::slave_thread(sAgentConfig conf, beerocks::logging &logger_)
+     : cmdu_tx(m_tx_buffer, sizeof(m_tx_buffer)), config(conf), logger(logger_)
+ {
+@@ -229,6 +230,25 @@
+         interfaces += fronthaul_iface;
+         interfaces += ',';
+     }
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    for (const auto &entry : config.sta_only_radios) {
++        auto radio = db->add_radio("", entry.first);
++        if (radio) radio->wireless_device = entry.second;
++        if (!radio || !db->refresh_sta_only_radio(*radio)) {
++            LOG(ERROR) << "Cannot initialize standalone STA radio " << entry.first;
++            m_constructor_failed = true;
++            return;
++        }
++        for (auto other : db->get_radios_list()) {
++            if (other != radio && other->radio_uid() != net::network_utils::ZERO_MAC &&
++                other->radio_uid() == radio->radio_uid()) {
++                LOG(ERROR) << "Duplicate physical radio UID";
++                m_constructor_failed = true;
++                return;
++            }
++        }
++    }
++#endif
+     if (interfaces.length()) {
+         interfaces.pop_back();
+     }
+@@ -1250,6 +1270,10 @@
+             return false;
+         }
+ 
++        if (!radio->has_ap()) {
++            LOG(WARNING) << "AP operation requested on dedicated STA radio " << radio->radio_uid();
++            return false;
++        }
+         fronthaul_iface = radio->front.iface_name;
+ 
+         // ZWDFS Radio should ignore messages from the Controller
+@@ -1895,6 +1919,7 @@
+         auto front_iface_str = notification_in->iface();
+         LOG(DEBUG) << "Received ACTION_BACKHAUL_ENABLE_APS_REQUEST iface=" << front_iface_str;
+ 
++        if (!config.radios.count(front_iface_str)) return false;
+         auto &radio_manager = m_radio_managers[front_iface_str];
+ 
+         auto notification_out =
+@@ -2070,6 +2095,7 @@
+             LOG(ERROR) << "Failed building message cACTION_APMANAGER_START_WPS_PBC_REQUEST!";
+             return false;
+         }
++        if (!config.radios.count(iface)) return false;
+         auto &radio_manager = m_radio_managers[iface];
+         send_cmdu(radio_manager.ap_manager_fd, cmdu_tx);
+         break;
+@@ -2081,6 +2107,10 @@
+         if (!radio) {
+             break;
+         }
++        if (!radio->has_ap()) {
++            LOG(WARNING) << "AP request cannot target dedicated STA radio " << radio->radio_uid();
++            return false;
++        }
+         auto &radio_manager = m_radio_managers[radio->front.iface_name];
+ 
+         if (radio_manager.ap_manager_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
+@@ -2115,6 +2145,10 @@
+         if (!radio) {
+             break;
+         }
++        if (!radio->has_ap()) {
++            LOG(WARNING) << "AP request cannot target dedicated STA radio " << radio->radio_uid();
++            return false;
++        }
+         auto &radio_manager = m_radio_managers[radio->front.iface_name];
+ 
+         auto request_in =
+@@ -2143,6 +2177,10 @@
+         auto radio      = db->get_radio_by_mac(radio_mac, AgentDB::eMacType::RADIO);
+         if (!radio) {
+             break;
++        }
++        if (!radio->has_ap()) {
++            LOG(WARNING) << "AP request cannot target dedicated STA radio " << radio->radio_uid();
++            return false;
+         }
+         auto &radio_manager = m_radio_managers[radio->front.iface_name];
+ 
+@@ -2181,6 +2219,10 @@
+         if (!radio) {
+             break;
+         }
++        if (!radio->has_ap()) {
++            LOG(WARNING) << "AP request cannot target dedicated STA radio " << radio->radio_uid();
++            return false;
++        }
+         auto &radio_manager = m_radio_managers[radio->front.iface_name];
+ 
+         LOG(DEBUG) << "received ACTION_BACKHAUL_HOSTAP_CANCEL_ACTIVE_CAC_REQUEST";
+@@ -2270,6 +2312,7 @@
+             LOG(ERROR) << "Failed building message cACTION_APMANAGER_RADIO_DISABLE_REQUEST!";
+             return false;
+         }
++        if (!config.radios.count(iface)) return false;
+         auto &radio_manager                     = m_radio_managers[iface];
+         radio_manager.configuration_in_progress = true;
+         send_cmdu(radio_manager.ap_manager_fd, cmdu_tx);
+@@ -2288,6 +2331,10 @@
+         auto radio      = db->get_radio_by_mac(radio_mac, AgentDB::eMacType::RADIO);
+         if (!radio) {
+             break;
++        }
++        if (!radio->has_ap()) {
++            LOG(WARNING) << "AP request cannot target dedicated STA radio " << radio->radio_uid();
++            return false;
+         }
+         auto &radio_manager = m_radio_managers[radio->front.iface_name];
+ 
+@@ -2359,6 +2406,10 @@
+         if (!radio) {
+             break;
+         }
++        if (!radio->has_ap()) {
++            LOG(WARNING) << "AP request cannot target dedicated STA radio " << radio->radio_uid();
++            return false;
++        }
+         auto &radio_manager = m_radio_managers[radio->front.iface_name];
+ 
+         auto request_in =
+@@ -2389,6 +2440,10 @@
+         if (!radio) {
+             break;
+         }
++        if (!radio->has_ap()) {
++            LOG(WARNING) << "AP request cannot target dedicated STA radio " << radio->radio_uid();
++            return false;
++        }
+         auto &radio_manager = m_radio_managers[radio->front.iface_name];
+ 
+         LOG(TRACE) << "ACTION_BACKHAUL_CHANNEL_SCAN_ABORT_REQUEST";
+@@ -2418,6 +2473,10 @@
+         auto radio      = db->get_radio_by_mac(radio_mac, AgentDB::eMacType::RADIO);
+         if (!radio) {
+             break;
++        }
++        if (!radio->has_ap()) {
++            LOG(WARNING) << "AP request cannot target dedicated STA radio " << radio->radio_uid();
++            return false;
+         }
+         auto &radio_manager = m_radio_managers[radio->front.iface_name];
+ 
+@@ -5599,7 +5658,7 @@
+ 
+         // Go over all the radios and check if at least for one of them a wireless backhaul is
+         // defined.
+-        bool backhaul_wireless_iface_exist = false;
++        bool backhaul_wireless_iface_exist = !config.sta_only_radios.empty();
+         for (const auto &radio_conf_element : config.radios) {
+             if (!radio_conf_element.second.backhaul_wireless_iface.empty()) {
+                 backhaul_wireless_iface_exist = true;
+@@ -5727,6 +5786,7 @@
+ 
+         const auto &radio = db->get_radios_list();
+         for (const auto &radio_to_update : radio) {
++            if (!radio_to_update->has_ap()) continue;
+             auto counter_update = message_com::create_vs_message<
+                 beerocks_message::cACTION_MONITOR_BYTE_COUNTER_UNITS_UPDATE_NOTIFICATION>(cmdu_tx);
+             if (!counter_update) {
+@@ -5767,7 +5827,8 @@
+             }
+             if (freq_type_to_scan != beerocks::FREQ_UNKNOWN) {
+                 for (const auto &radio_to_scan : radio) {
+-                    if (radio_to_scan->wifi_channel.get_freq_type() == freq_type_to_scan &&
++                    if (radio_to_scan->has_ap() &&
++                        radio_to_scan->wifi_channel.get_freq_type() == freq_type_to_scan &&
+                         radio_to_scan->front.iface_mac != network_utils::ZERO_MAC) {
+                         on_boot_scan_request->radio_mac() = radio_to_scan->front.iface_mac;
+                         break;
+@@ -6400,6 +6461,7 @@
+ {
+     auto db = AgentDB::get();
+     for (auto radio : db->get_radios_list()) {
++        if (!radio->has_ap()) continue;
+         if (!forward_cmdu_to_uds(m_radio_managers[radio->front.iface_name].ap_manager_fd,
+                                  cmdu_rx)) {
+             LOG(ERROR) << "Failed sending UNASSOCIATED_STA_LINK_METRICS_QUERY_MESSAGE message to "
+--- a/agent/src/beerocks/slave/son_slave_thread.h
++++ b/agent/src/beerocks/slave/son_slave_thread.h
+@@ -69,6 +69,8 @@
+ 
+         // key: fronthaul interface name
+         std::unordered_map<std::string, sRadioConfig> radios;
++        // STA endpoint -> committed physical wireless device. No AP manager.
++        std::unordered_map<std::string, std::string> sta_only_radios;
+     };
+ 
+     enum eSlaveState : int;
+@@ -287,12 +289,16 @@
+ 
+     inline int get_ap_manager_fd(const std::string &fronthaul_iface)
+     {
+-        return m_radio_managers[fronthaul_iface].ap_manager_fd;
++        return config.radios.count(fronthaul_iface)
++                   ? m_radio_managers[fronthaul_iface].ap_manager_fd
++                   : beerocks::net::FileDescriptor::invalid_descriptor;
+     }
+ 
+     inline int get_monitor_fd(const std::string &fronthaul_iface)
+     {
+-        return m_radio_managers[fronthaul_iface].monitor_fd;
++        return config.radios.count(fronthaul_iface)
++                   ? m_radio_managers[fronthaul_iface].monitor_fd
++                   : beerocks::net::FileDescriptor::invalid_descriptor;
+     }
+ 
+     inline const CmduClient *get_backhaul_manager_cmdu_client()
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -121,31 +121,31 @@
+         return false;
+     }
+ 
+-    if (radio->wifi_channel.get_freq_type() == beerocks::eFreqType::FREQ_24G) {
++    if (radio->frequency_band() == beerocks::eFreqType::FREQ_24G) {
+         if (op_std.s_80211a || op_std.s_80211ac) {
+             LOG(ERROR) << "Invalid operating standards for freq type "
+                        << beerocks::utils::convert_frequency_type_to_string(
+-                              radio->wifi_channel.get_freq_type());
++                              radio->frequency_band());
+             return false;
+         }
+-    } else if (radio->wifi_channel.get_freq_type() == beerocks::eFreqType::FREQ_5G) {
++    } else if (radio->frequency_band() == beerocks::eFreqType::FREQ_5G) {
+         if (op_std.s_80211b || op_std.s_80211g) {
+             LOG(ERROR) << "Invalid operating standards for freq type "
+                        << beerocks::utils::convert_frequency_type_to_string(
+-                              radio->wifi_channel.get_freq_type());
++                              radio->frequency_band());
+             return false;
+         }
+-    } else if (radio->wifi_channel.get_freq_type() == beerocks::eFreqType::FREQ_6G) {
++    } else if (radio->frequency_band() == beerocks::eFreqType::FREQ_6G) {
+         if (!(op_std.s_80211be || op_std.s_80211ax)) {
+             LOG(ERROR) << "Invalid operating standards for freq type "
+                        << beerocks::utils::convert_frequency_type_to_string(
+-                              radio->wifi_channel.get_freq_type());
++                              radio->frequency_band());
+             return false;
+         }
+     } else {
+         LOG(ERROR) << "unsupported freq type"
+                    << beerocks::utils::convert_frequency_type_to_string(
+-                          radio->wifi_channel.get_freq_type())
++                          radio->frequency_band())
+                    << ", iface=" << radio_iface;
+         return false;
+     }
+@@ -363,21 +363,21 @@
+ 
+             // If another radio with same band already finished the discovery phase, we can skip
+             // directly to next phase (AP_CONFIGURATION).
+-            if (m_discovery_status[radio->wifi_channel.get_freq_type()].completed) {
++            if (m_discovery_status[radio->frequency_band()].completed) {
+                 FSM_MOVE_STATE(radio_iface, eState::SEND_AP_AUTOCONFIGURATION_WSC_M1);
+             }
+ 
+             // If another radio with same band already have sent the
+             // AP_AUTOCONFIGURATION_SEARCH_MESSAGE, we can skip and let it handle it.
+-            if (m_discovery_status[radio->wifi_channel.get_freq_type()].msg_sent) {
++            if (m_discovery_status[radio->frequency_band()].msg_sent) {
+                 continue;
+             }
+ 
+             if (send_ap_autoconfiguration_search_message(radio_iface)) {
+-                m_discovery_status[radio->wifi_channel.get_freq_type()].msg_sent = true;
+-            }
+-
+-            if (m_discovery_status[radio->wifi_channel.get_freq_type()].skipped) {
++                m_discovery_status[radio->frequency_band()].msg_sent = true;
++            }
++
++            if (m_discovery_status[radio->frequency_band()].skipped) {
+                 FSM_MOVE_STATE(radio_iface, eState::SKIPPED);
+                 break;
+             }
+@@ -395,7 +395,7 @@
+                 continue;
+             }
+ 
+-            auto &discovery_status = m_discovery_status[radio->wifi_channel.get_freq_type()];
++            auto &discovery_status = m_discovery_status[radio->frequency_band()];
+ 
+             if (discovery_status.completed) {
+                 FSM_MOVE_STATE(radio_iface, eState::SEND_AP_AUTOCONFIGURATION_WSC_M1);
+@@ -487,6 +487,8 @@
+         // Send pre-associated sta notification request to all radio
+         for (const auto &radios_conf_param_kv : m_radios_conf_params) {
+             const auto &radio_iface = radios_conf_param_kv.first;
++            auto radio = db->radio(radio_iface);
++            if (radio && !radio->has_ap()) continue;
+             if (radios_conf_param_kv.second.state == eState::SKIPPED) {
+                 LOG(ERROR) << "Skipping send_ap_connected_sta_notifications_request for "
+                            << radio_iface;
+@@ -530,13 +532,13 @@
+ 
+             if (event_obj) {
+                 auto specific_iface_ptr = reinterpret_cast<const std::string *>(event_obj);
+-                if (*specific_iface_ptr != radio->front.iface_name) {
++                if (*specific_iface_ptr != radio->iface_name()) {
+                     continue;
+                 }
+             }
+ 
+-            LOG(DEBUG) << "starting discovery sequence on radio_iface=" << radio->front.iface_name;
+-            FSM_MOVE_STATE(radio->front.iface_name, eState::CONTROLLER_DISCOVERY);
++            LOG(DEBUG) << "starting discovery sequence on radio_iface=" << radio->iface_name();
++            FSM_MOVE_STATE(radio->iface_name(), eState::CONTROLLER_DISCOVERY);
+             m_task_is_active = true;
+         }
+ 
+@@ -647,8 +649,9 @@
+ 
+     // Send AP MLD Configuration as Reconfig Flow True
+     for (auto radio : db->get_radios_list()) {
+-        for (auto &ap_mld_request : m_ap_mld_requests_infos[radio->front.iface_name]) {
+-            send_ap_mld_configuration(radio->front.iface_name, ap_mld_request.first,
++        if (!radio->has_ap()) continue;
++        for (auto &ap_mld_request : m_ap_mld_requests_infos[radio->iface_name()]) {
++            send_ap_mld_configuration(radio->iface_name(), ap_mld_request.first,
+                                       std::get<0>(ap_mld_request.second),
+                                       std::get<1>(ap_mld_request.second), true);
+         }
+@@ -856,11 +859,11 @@
+         LOG(DEBUG) << "Radio of iface " << radio_iface << " does not exist on the db";
+         return false;
+     }
+-    if (radio->wifi_channel.get_freq_type() == beerocks::eFreqType::FREQ_24G) {
++    if (radio->frequency_band() == beerocks::eFreqType::FREQ_24G) {
+         freq_band = ieee1905_1::tlvAutoconfigFreqBand::IEEE_802_11_2_4_GHZ;
+-    } else if (radio->wifi_channel.get_freq_type() == beerocks::eFreqType::FREQ_5G) {
++    } else if (radio->frequency_band() == beerocks::eFreqType::FREQ_5G) {
+         freq_band = ieee1905_1::tlvAutoconfigFreqBand::IEEE_802_11_5_GHZ;
+-    } else if (radio->wifi_channel.get_freq_type() == beerocks::eFreqType::FREQ_6G) {
++    } else if (radio->frequency_band() == beerocks::eFreqType::FREQ_6G) {
+         if (db->device_conf.certification_mode &&
+             db->device_conf.certification_program != std::string("mapr6")) {
+             LOG(INFO) << "Certification mode: skipping AP-Autoconfiguration Search on 6GHz iface: "
+@@ -870,7 +873,7 @@
+         }
+         freq_band = ieee1905_1::tlvAutoconfigFreqBand::IEEE_802_11_6_GHZ;
+     } else {
+-        LOG(ERROR) << "unsupported freq_type=" << int(radio->wifi_channel.get_freq_type())
++        LOG(ERROR) << "unsupported freq_type=" << int(radio->frequency_band())
+                    << ", iface=" << radio_iface;
+         return false;
+     }
+@@ -1017,6 +1020,15 @@
+     if (!radio) {
+         return false;
+     }
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    if (!radio->has_ap()) {
++        db->statuses.ap_autoconfiguration_completed = false;
++        if (!db->refresh_sta_only_radio(*radio)) {
++            LOG(ERROR) << "Dedicated STA radio cannot provide current physical capabilities";
++            return false;
++        }
++    }
++#endif
+ 
+     if (!tlvf_utils::add_ap_radio_basic_capabilities(m_cmdu_tx, radio->front.iface_mac)) {
+         LOG(ERROR) << "Failed adding AP Radio Basic Capabilities TLV";
+@@ -1084,7 +1096,7 @@
+ 
+     // The add_vs_tlv method invokes the handler to add Vendor specific TLVs to the
+     // AP_AUTOCONFIGURATION_WSC_MESSAGE.
+-    if (!db->controller_info.prplmesh_controller) {
++    if (!db->controller_info.prplmesh_controller || !radio->has_ap()) {
+         if (!multi_vendor::tlvf_handler::add_vs_tlv(
+                 m_cmdu_tx, ieee1905_1::eMessageType::AP_AUTOCONFIGURATION_WSC_MESSAGE)) {
+             LOG(ERROR) << "Failed adding few TLVs in AP_AUTOCONFIGURATION_WSC_MESSAGE";
+@@ -1123,7 +1135,7 @@
+     std::string first_radio_iface;
+     auto first_radio_it = db->get_radios_list().begin();
+     if (first_radio_it != db->get_radios_list().end()) {
+-        first_radio_iface = (*first_radio_it)->front.iface_name;
++        first_radio_iface = (*first_radio_it)->iface_name();
+     }
+     bool wired_bh_manager =
+         db->backhaul.connection_type == AgentDB::sBackhaul::eConnectionType::Wired &&
+@@ -1176,12 +1188,12 @@
+     notification->wlan_settings().channel =
+         db->device_conf.front_radio.config.at(radio_iface).configured_channel;
+     // Hostap Params
+-    string_utils::copy_string(notification->hostap().iface_name, radio->front.iface_name.c_str(),
++    string_utils::copy_string(notification->hostap().iface_name, radio->iface_name().c_str(),
+                               beerocks::message::IFACE_NAME_LENGTH);
+     notification->hostap().iface_mac      = radio->front.iface_mac;
+     notification->hostap().ant_num        = radio->number_of_antennas;
+     notification->hostap().tx_power       = radio->tx_power_dB;
+-    notification->hostap().frequency_band = radio->wifi_channel.get_freq_type();
++    notification->hostap().frequency_band = radio->frequency_band();
+     notification->hostap().max_bandwidth  = radio->max_supported_bw;
+     notification->hostap().ht_supported   = radio->ht_supported;
+     notification->hostap().ht_capability  = radio->ht_capability;
+@@ -1200,7 +1212,7 @@
+     notification->cs_params().bandwidth = radio->wifi_channel.get_bandwidth();
+     notification->cs_params().channel_ext_above_primary =
+         radio->wifi_channel.get_ext_above_primary();
+-    if (radio->wifi_channel.get_freq_type() == eFreqType::FREQ_6G &&
++    if (radio->frequency_band() == eFreqType::FREQ_6G &&
+         radio->wifi_channel.get_bandwidth() == eWiFiBandwidth::BANDWIDTH_160) {
+         notification->cs_params().vht_center_frequency =
+             radio->wifi_channel.get_center_frequency_2();
+@@ -1270,7 +1282,7 @@
+     cfg.model_number        = board_info.model_number;
+     cfg.primary_dev_type_id = WSC::WSC_DEV_NETWORK_INFRA_AP;
+     cfg.device_name         = "prplmesh-agent";
+-    switch (radio->wifi_channel.get_freq_type()) {
++    switch (radio->frequency_band()) {
+     case beerocks::FREQ_24G:
+         cfg.bands = WSC::WSC_RF_BAND_2GHZ;
+         break;
+@@ -1287,7 +1299,7 @@
+         LOG(ERROR) << "The frequency type of " << radio_iface
+                    << " must be 2.4GHz, 5GHz or 6GHz. Frequency:"
+                    << beerocks::utils::convert_frequency_type_to_string(
+-                          radio->wifi_channel.get_freq_type());
++                          radio->frequency_band());
+         return false;
+     }
+     auto attributes = WSC::m1::create(*tlv, cfg);
+@@ -1524,6 +1536,7 @@
+     sMacAddr radio_iface_mac;
+     eFreqType radio_freq_type;
+     bool em_ap_controller_found = false;
++    bool sta_only_radio = false;
+     {
+         auto db    = AgentDB::get();
+         auto radio = db->get_radio_by_mac(ruid->radio_uid(), AgentDB::eMacType::RADIO);
+@@ -1533,20 +1546,25 @@
+         }
+ 
+ #ifdef PRPLMESH_STOCK_OPENWRT_UCI
++        if (!radio->has_ap() && ruid->radio_uid() != radio->radio_uid()) {
++            LOG(ERROR) << "M2 identifier is not the dedicated physical radio UID";
++            return;
++        }
+         // The pending AP-manager response certifies the current native apply.
+         // Do not let a second M2 replace it before that readback completes.
+-        const auto pending = m_radios_conf_params.find(radio->front.iface_name);
++        const auto pending = m_radios_conf_params.find(radio->iface_name());
+         if (pending != m_radios_conf_params.end() &&
+             pending->second.state == eState::WAIT_AP_CONFIGURATION_COMPLETE) {
+             LOG(DEBUG) << "Ignoring overlapping M2 while native configuration is pending for "
+-                       << radio->front.iface_name;
++                       << radio->iface_name();
+             return;
+         }
+ #endif
+ 
+-        radio_iface_name       = radio->front.iface_name;
++        sta_only_radio          = !radio->has_ap();
++        radio_iface_name       = radio->iface_name();
+         radio_iface_mac        = radio->front.iface_mac;
+-        radio_freq_type        = radio->wifi_channel.get_freq_type();
++        radio_freq_type        = radio->frequency_band();
+         em_ap_controller_found = db->em_ap_controller_found;
+ 
+         // M2 received: controller already made its capability-dependent
+@@ -1555,7 +1573,7 @@
+     }
+     LOG(DEBUG) << "Received AP_AUTOCONFIGURATION_WSC_MESSAGE for iface " << radio_iface_name;
+ 
+-    if (em_ap_controller_found) {
++    if (em_ap_controller_found && !sta_only_radio) {
+         LOG(DEBUG) << "EM+ controller is found. Check for Service Status";
+         if (!airties_vs_ap_autoconfiguration_wsc_parse_service_status(cmdu_rx, radio_iface_name)) {
+             LOG(INFO) << "Service Status is not found in Vendor Specific TLV";
+@@ -1581,6 +1599,10 @@
+             LOG(INFO) << "Not a valid Registration Protocol messages - Ignoring WSC CMDU";
+         }
+         if (!m2) {
++            if (sta_only_radio) {
++                LOG(ERROR) << "Dedicated STA accepts only authenticated M2 TearDown";
++                return;
++            }
+             LOG(INFO) << "Not a valid M2 - Ignoring WSC CMDU";
+             continue;
+         }
+@@ -1594,7 +1616,7 @@
+     std::unordered_set<std::string> misconfigured_ssids;
+     const bool ts_policy_tlv_present =
+         static_cast<bool>(cmdu_rx.getClass<wfa_map::tlvProfile2TrafficSeparationPolicy>());
+-    {
++    if (!sta_only_radio) {
+         auto db = AgentDB::get();
+ 
+         // Keep the complete TS policy update atomic with respect to backhaul VLAN telemetry.
+@@ -1618,6 +1640,37 @@
+         LOG(ERROR) << "handle_wsc_m2_tlv has failed!";
+         return;
+     }
++
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    {
++        auto db = AgentDB::get();
++        auto radio = db->radio(radio_iface_name);
++        if (radio && !radio->has_ap()) {
++            auto &state = m_radios_conf_params[radio_iface_name];
++            const bool teardown = !bss_infos.empty() &&
++                std::all_of(bss_infos.begin(), bss_infos.end(), [](const auto &bss) {
++                    return bss.controller_teardown;
++                });
++            if (!teardown || m8 || !db->refresh_sta_only_radio(*radio)) {
++                LOG(ERROR) << "Controller configuration conflicts with standalone STA radio "
++                           << radio_iface_name << ": explicit TearDown and no AP owner required";
++                state.configuration_applied = false;
++                db->statuses.ap_autoconfiguration_completed = false;
++                state.timeout = std::chrono::steady_clock::now() + std::chrono::seconds(
++                    beerocks::ieee1905_1_consts::AUTOCONFIG_M2_TIMEOUT_SECONDS);
++                FSM_MOVE_STATE(radio_iface_name, eState::WAIT_AP_AUTOCONFIGURATION_WSC_M2);
++                return;
++            }
++            state.num_of_bss_available = 0;
++            state.enabled_bssids.clear();
++            state.configuration_applied = true;
++            // Native committed configuration and actual hostapd ownership were
++            // observed quiet; there is no AP-manager response to manufacture.
++            FSM_MOVE_STATE(radio_iface_name, eState::CONFIGURED);
++            return;
++        }
++    }
++#endif
+ 
+     sBStaConfig bsta_info;
+     if (m8 && !handle_wsc_m8_tlv(radio_iface_name, m8, bsta_info)) {
+@@ -1789,13 +1842,13 @@
+             return;
+         }
+ 
+-        auto &radio_conf_params = m_radios_conf_params[radio->front.iface_name];
++        auto &radio_conf_params = m_radios_conf_params[radio->iface_name()];
+         const bool renew_already_in_progress =
+             (radio_conf_params.state == eState::SEND_AP_AUTOCONFIGURATION_WSC_M1) ||
+             (radio_conf_params.state == eState::WAIT_AP_AUTOCONFIGURATION_WSC_M2) ||
+             (radio_conf_params.state == eState::WAIT_AP_CONFIGURATION_COMPLETE);
+         if (renew_already_in_progress) {
+-            LOG(DEBUG) << "Delay renew on " << radio->front.iface_name << " while state is "
++            LOG(DEBUG) << "Delay renew on " << radio->iface_name() << " while state is "
+                        << fsm_state_to_string(radio_conf_params.state);
+             radio_conf_params.pending_renew = true;
+             continue;
+@@ -1804,12 +1857,12 @@
+         m_task_is_active = true;
+ 
+         // Refresh VAP info to ensure accurate BSS configuration matching
+-        if (!send_ap_bss_info_update_request(radio->front.iface_name)) {
++        if (radio->has_ap() && !send_ap_bss_info_update_request(radio->iface_name())) {
+             LOG(WARNING) << "send_ap_bss_info_update_request has failed for "
+-                         << radio->front.iface_name;
+-        }
+-
+-        FSM_MOVE_STATE(radio->front.iface_name, eState::SEND_AP_AUTOCONFIGURATION_WSC_M1);
++                         << radio->iface_name();
++        }
++
++        FSM_MOVE_STATE(radio->iface_name(), eState::SEND_AP_AUTOCONFIGURATION_WSC_M1);
+     }
+ }
+ 
+@@ -1914,9 +1967,10 @@
+     auto qos_management_policy_tlv = cmdu_rx.getClass<wfa_map::tlvQoSManagementPolicy>();
+     if (qos_management_policy_tlv) {
+         for (auto radio : db->get_radios_list()) {
+-            auto ap_manager_fd = m_btl_ctx.get_ap_manager_fd(radio->front.iface_name);
++            if (!radio->has_ap()) continue;
++            auto ap_manager_fd = m_btl_ctx.get_ap_manager_fd(radio->iface_name());
+             if (ap_manager_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
+-                LOG(ERROR) << "Invalid AP manager fd for radio " << radio->front.iface_name;
++                LOG(ERROR) << "Invalid AP manager fd for radio " << radio->iface_name();
+                 continue;
+             }
+ 
+@@ -1989,7 +2043,8 @@
+                 continue;
+             }
+ 
+-            auto monitor_fd = m_btl_ctx.get_monitor_fd(radio->front.iface_name);
++            if (!radio->has_ap()) continue;
++            auto monitor_fd = m_btl_ctx.get_monitor_fd(radio->iface_name());
+ 
+             /**
+              * The Agent forwards the request message again "as is" to the monitor thread.
+@@ -2074,6 +2129,7 @@
+     db->traffic_separation.default_pcp     = dot1q_settings->default_pcp();
+ 
+     for (auto radio : db->get_radios_list()) {
++        if (!radio->has_ap()) continue;
+         auto pvid_set_request = message_com::create_vs_message<
+             beerocks_message::cACTION_APMANAGER_HOSTAP_SET_PRIMARY_VLAN_ID_REQUEST>(m_cmdu_tx);
+         if (!pvid_set_request) {
+@@ -2084,7 +2140,7 @@
+         pvid_set_request->primary_vlan_id() = dot1q_settings->primary_vlan_id();
+ 
+         // Send ACTION_APMANAGER_HOSTAP_SET_PRIMARY_VLAN_ID_REQUEST.
+-        auto ap_manager_fd = m_btl_ctx.get_ap_manager_fd(radio->front.iface_name);
++        auto ap_manager_fd = m_btl_ctx.get_ap_manager_fd(radio->iface_name());
+         m_btl_ctx.send_cmdu(ap_manager_fd, m_cmdu_tx);
+     }
+ 
+@@ -2162,12 +2218,12 @@
+         uint8_t authkey[32];
+         uint8_t keywrapkey[16];
+         LOG(DEBUG) << "M2 Parse: calculate keys";
+-        if (!ap_autoconfiguration_wsc_calculate_keys(radio->front.iface_name, m2.public_key(),
++        if (!ap_autoconfiguration_wsc_calculate_keys(radio->iface_name(), m2.public_key(),
+                                                      m2.public_key_length(), m2.registrar_nonce(),
+                                                      authkey, keywrapkey))
+             return false;
+ 
+-        if (!ap_autoconfiguration_wsc_authenticate(radio->front.iface_name, m2, authkey,
++        if (!ap_autoconfiguration_wsc_authenticate(radio->iface_name(), m2, authkey,
+                                                    reinterpret_cast<uint8_t *>(m2.authenticator())))
+             return false;
+ 
+@@ -2193,11 +2249,11 @@
+         info.m2_config.hidden_ssid = m2.hidden_ssid();
+ 
+         // EM_AP_CONTROLLER specific Vendor Extension Attributes
+-        if (db->em_ap_controller_found) {
++        if (db->em_ap_controller_found && radio->has_ap()) {
+             LOG(DEBUG) << "EM+ controller is found. Check for Hidden SSID parameters";
+ 
+             if (!airties_vs_ap_autoconfiguration_wsc_parse_radio_operational_mode_config(
+-                    radio->front.iface_name, m2)) {
++                    radio->iface_name(), m2)) {
+                 LOG(INFO) << "Radio Operational Mode Config not found in Vendor Extension";
+             }
+         }
+@@ -2217,6 +2273,15 @@
+                  WSC::eWscVendorExtSubelementBssType::PROFILE2_BACKHAUL_STA_ASSOCIATION_DISALLOWED);
+         bool teardown =
+             bool(info.payload_config.bss_type & WSC::eWscVendorExtSubelementBssType::TEARDOWN);
++        info.controller_teardown = teardown;
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++        if (!radio->has_ap()) {
++            // Preserve every authenticated M2 disposition. AP compatibility
++            // filtering must not hide a non-TearDown request from strict policy.
++            infos.push_back(info);
++            continue;
++        }
++#endif
+ 
+         std::stringstream ss;
+         ss << "Parsed M2 info: " << std::endl;
+@@ -2354,12 +2419,12 @@
+     uint8_t authkey[32];
+     uint8_t keywrapkey[16];
+     LOG(DEBUG) << "M8 Parse: calculate keys";
+-    if (!ap_autoconfiguration_wsc_calculate_keys(radio->front.iface_name, m8->public_key(),
++    if (!ap_autoconfiguration_wsc_calculate_keys(radio->iface_name(), m8->public_key(),
+                                                  m8->public_key_length(), m8->registrar_nonce(),
+                                                  authkey, keywrapkey))
+         return false;
+ 
+-    if (!ap_autoconfiguration_wsc_authenticate(radio->front.iface_name, *m8, authkey,
++    if (!ap_autoconfiguration_wsc_authenticate(radio->iface_name(), *m8, authkey,
+                                                reinterpret_cast<uint8_t *>(m8->authenticator())))
+         return false;
+ 
+@@ -2524,7 +2589,8 @@
+                 LOG(ERROR) << "RUID not found: " << affiliated_conf.ruid;
+                 continue;
+             }
+-            const std::string rad_iface = radio->front.iface_name;
++            if (!radio->has_ap()) return false;
++            const std::string rad_iface = radio->iface_name();
+             m_ap_mld_requests_infos[rad_iface][current_ap_mld_conf.mld_config.mld_ssid] = {
+                 current_ap_mld_conf.mld_config.mld_unit, current_ap_mld_conf.mld_config.mld_mode};
+         }
+@@ -2558,7 +2624,7 @@
+ 
+     // Process all radios for missing mld links
+     for (auto radio : db->get_radios_list()) {
+-        process_missing_mld_links(radio->front.iface_name);
++        process_missing_mld_links(radio->iface_name());
+     }
+ 
+     return true;
+@@ -2946,7 +3012,7 @@
+     }
+ 
+     LOG(TRACE) << "received ACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_RESPONSE from "
+-               << radio->front.iface_name;
++               << radio->iface_name();
+ 
+     // This value have an arbitrary value based on observation on real platform behavior.
+     constexpr uint8_t WAIT_AP_ENABLED_TIMEOUT_SECONDS = 20;
+@@ -3035,7 +3101,7 @@
+ 
+     notification_out->vap_id()   = notification_in->vap_id();
+     notification_out->vap_info() = notification_in->vap_info();
+-    m_btl_ctx.send_cmdu_to_controller(radio->front.iface_name, m_cmdu_tx);
++    m_btl_ctx.send_cmdu_to_controller(radio->iface_name(), m_cmdu_tx);
+ 
+     // Restore the active bit here as well because AP_ENABLED can arrive before
+     // the next VAP list refresh and the TS full rebuild relies on the current
+@@ -3121,7 +3187,7 @@
+         return;
+     }
+ 
+-    const auto &fronthaul_iface = radio->front.iface_name;
++    const auto &fronthaul_iface = radio->iface_name();
+ 
+     auto &radio_conf_params = m_radios_conf_params[radio_iface];
+     LOG(INFO) << "received ACTION_APMANAGER_HOSTAP_VAPS_LIST_UPDATE_NOTIFICATION "
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+@@ -92,6 +92,7 @@
+     struct sBssConfig {
+         WSC::m2::config m2_config;
+         WSC::EncryptedSettingsPayload::config payload_config;
++        bool controller_teardown = false; // Authenticated flag, before compatibility normalization.
+         int8_t mld_id = DISABLED_MLDUNIT;
+         son::wireless_utils::eAdditionalAuth additional_auth =
+             son::wireless_utils::eAdditionalAuth::NONE;
+--- a/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
++++ b/agent/src/beerocks/slave/tasks/capability_reporting_task.cpp
+@@ -596,23 +596,23 @@
+             return false;
+         }
+ 
+-        if (!add_ap_ht_capabilities(radio->front.iface_name)) {
+-            return false;
+-        }
+-
+-        if (!add_ap_vht_capabilities(radio->front.iface_name)) {
+-            return false;
+-        }
+-
+-        if (!add_ap_he_capabilities(radio->front.iface_name)) {
+-            return false;
+-        }
+-
+-        if (!add_ap_wifi6_capabilities(radio->front.iface_name)) {
+-            return false;
+-        }
+-
+-        if (!add_ap_radio_advanced_capabilities_tlv(radio->front.iface_name)) {
++        if (!add_ap_ht_capabilities(radio->iface_name())) {
++            return false;
++        }
++
++        if (!add_ap_vht_capabilities(radio->iface_name())) {
++            return false;
++        }
++
++        if (!add_ap_he_capabilities(radio->iface_name())) {
++            return false;
++        }
++
++        if (!add_ap_wifi6_capabilities(radio->iface_name())) {
++            return false;
++        }
++
++        if (!add_ap_radio_advanced_capabilities_tlv(radio->iface_name())) {
+             return false;
+         }
+ 
+@@ -819,10 +819,11 @@
+      * Bit  4     : MU beamformer capable.
+      * Bit  3-0   : Reserved
+      */
+-    uint16_t vht_rx_mcs = 0xffff;
+-    uint16_t vht_tx_mcs = 0xffff;
+-    memcpy(&vht_rx_mcs, &radio->vht_mcs_set[RX_VHT_MCS_MAP_OFFSET], sizeof(vht_rx_mcs));
+-    memcpy(&vht_tx_mcs, &radio->vht_mcs_set[TX_VHT_MCS_MAP_OFFSET], sizeof(vht_tx_mcs));
++    // Native IEEE MCS maps are little endian; TLVF's uint16 fields take host values.
++    const auto *rx = &radio->vht_mcs_set[RX_VHT_MCS_MAP_OFFSET];
++    const auto *tx = &radio->vht_mcs_set[TX_VHT_MCS_MAP_OFFSET];
++    const uint16_t vht_rx_mcs = rx[0] | (uint16_t(rx[1]) << 8);
++    const uint16_t vht_tx_mcs = tx[0] | (uint16_t(tx[1]) << 8);
+ 
+     tlv->supported_vht_rx_mcs() = vht_rx_mcs;
+     tlv->supported_vht_tx_mcs() = vht_tx_mcs;
+--- a/agent/src/beerocks/slave/tasks/channel_scan_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_scan_task.cpp
+@@ -42,7 +42,7 @@
+ 
+     for (auto radio : db->get_radios_list()) {
+         // if radio_name is provided, only log scan results for this radio
+-        if (!radio_name.empty() && radio->front.iface_name != radio_name) {
++        if (!radio_name.empty() && radio->iface_name() != radio_name) {
+             continue;
+         }
+ 
+@@ -50,7 +50,7 @@
+             std::ostringstream chan_str;
+             auto result_k = std::get<0>(result_kv); // key : channel
+             auto result_v = std::get<1>(result_kv); // value : tuple <status, timestamp, scanResults
+-            chan_str << "radio " << radio->front.iface_name << " channel "
++            chan_str << "radio " << radio->iface_name() << " channel "
+                      << int(std::get<0>(result_kv)) << " numOfSSIDs "
+                      << std::get<2>(result_v).size() << " status " << int(std::get<0>(result_v));
+ 
+@@ -72,7 +72,7 @@
+         LOG(DEBUG) << "no radio with MAC " << radio_scan_info->radio_mac;
+         return;
+     }
+-    auto name = radio->front.iface_name;
++    auto name = radio->iface_name();
+     LOG(DEBUG) << "scan task cached scan results";
+ 
+     auto &results = radio_scan_info->cached_results;
+@@ -163,14 +163,14 @@
+             LOG(ERROR) << "radio does not exist in the db";
+             continue;
+         }
+-        auto &current_scan_info = m_current_scan_info[radio->front.iface_name];
++        auto &current_scan_info = m_current_scan_info[radio->iface_name()];
+         if (current_scan_info.is_scan_currently_running) {
+             auto current_scan_request = current_scan_info.scan_request;
+             auto current_radio_scan   = current_scan_info.radio_scan;
+ 
+             if (!current_scan_request || !current_radio_scan) {
+                 LOG(ERROR) << "Invalid active channel scan context for interface "
+-                           << radio->front.iface_name
++                           << radio->iface_name()
+                            << ": scan_request=" << bool(current_scan_request)
+                            << ", radio_scan=" << bool(current_radio_scan);
+                 current_scan_info = {};
+@@ -179,7 +179,7 @@
+ 
+             auto finalize_scan = [this, &radio, &current_scan_request]() {
+                 if (m_on_boot_scan_enabled) {
+-                    m_current_scan_info[radio->front.iface_name].is_scan_currently_running = false;
++                    m_current_scan_info[radio->iface_name()].is_scan_currently_running = false;
+                 } else {
+                     current_scan_request->ready_to_send_report = true;
+                 }
+@@ -274,9 +274,9 @@
+             // Handle finished requests.
+             if (!m_on_boot_scan_enabled && current_scan_request->ready_to_send_report) {
+                 // Report was sent back, clear any remaining scan info.
+-                m_current_scan_info[radio->front.iface_name].radio_scan                = nullptr;
+-                m_current_scan_info[radio->front.iface_name].scan_request              = nullptr;
+-                m_current_scan_info[radio->front.iface_name].is_scan_currently_running = false;
++                m_current_scan_info[radio->iface_name()].radio_scan                = nullptr;
++                m_current_scan_info[radio->iface_name()].scan_request              = nullptr;
++                m_current_scan_info[radio->iface_name()].is_scan_currently_running = false;
+                 if (!send_channel_scan_report_to_controller(current_scan_request)) {
+                     LOG(ERROR) << "Failed to send channel scan report!";
+                     return;
+@@ -284,7 +284,7 @@
+             }
+         } else {
+             // Handle pending requests.
+-            auto it = m_pending_requests.find(radio->front.iface_name);
++            auto it = m_pending_requests.find(radio->iface_name());
+             if (it != m_pending_requests.end()) {
+                 if (!trigger_next_radio_scan(it->first, it->second)) {
+                     LOG(ERROR) << "Failed to trigger the radio scan for radio: " << it->first;
+@@ -443,7 +443,7 @@
+         LOG(ERROR) << "Failed to get radio entry for MAC: " << src_mac;
+         return false;
+     }
+-    auto ifname = radio->front.iface_name;
++    auto ifname = radio->iface_name();
+ 
+     /**
+      * Since currently we handle only action_ops of action type "ACTION_BACKHAUL", use a single
+@@ -694,7 +694,7 @@
+         LOG(ERROR) << "Failed to get radio entry for MAC: " << request->radio_scans->radio_mac;
+         return false;
+     }
+-    auto radio_iface = radio->front.iface_name;
++    auto radio_iface = radio->iface_name();
+     LOG(TRACE) << "Request scan abort on " << radio_iface;
+     auto agent_fd = m_btl_ctx.get_agent_fd();
+     if (agent_fd == beerocks::net::FileDescriptor::invalid_descriptor) {
+@@ -772,6 +772,13 @@
+         LOG(ERROR) << "Failed to get radio info from Agent DB for " << radio_iface;
+         set_radio_scan_status(radio_scan_info, eScanStatus::SCAN_NOT_COMPLETED);
+         return false;
++    }
++
++    if (!radio->has_ap()) {
++        // The dedicated uplink has no AP monitor owner. Do not interrupt it for an AP scan.
++        set_radio_scan_status(radio_scan_info, eScanStatus::SCAN_NOT_SUPPORTED_ON_THIS_OPERATING_CLASS_AND_CHANNEL_ON_THIS_RADIO);
++        FSM_MOVE_STATE(radio_scan_info, eState::SCAN_FAILED);
++        return true;
+     }
+ 
+     if (radio_scan_info->dwell_time == 0) {
+@@ -987,7 +994,7 @@
+                 for (const auto operating_class_20MHz_channel : operating_class_20MHz_channels) {
+                     LOG(DEBUG) << "Checking if 20MHz channel " << operating_class_20MHz_channel
+                                << " is supported";
+-                    if (db_radio->channels_list.find(channel_number) ==
++                    if (!db_radio->has_ap() || db_radio->channels_list.find(channel_number) ==
+                         db_radio->channels_list.end()) {
+                         LOG(DEBUG) << "20MHz channel " << operating_class_20MHz_channel
+                                    << " is not supported";
+@@ -1011,6 +1018,7 @@
+         for (const auto channel_number : channel_list) {
+             if (!son::wireless_utils::is_channel_in_operating_class(operating_class,
+                                                                     channel_number) ||
++                !db_radio->has_ap() ||
+                 db_radio->channels_list.find(channel_number) == db_radio->channels_list.end()) {
+                 LOG(DEBUG) << "Channel #" << channel_number << " in operating class #"
+                            << operating_class << " is not supported on this radio";
+@@ -1094,9 +1102,10 @@
+             channel_vector.reserve(elem.second.size());
+             for (auto chan_num : elem.second) {
+                 // extract status from database
+-                eScanStatus new_status = eScanStatus::SCAN_NOT_COMPLETED;
++                eScanStatus new_status = radio->has_ap() ? eScanStatus::SCAN_NOT_COMPLETED :
++                    eScanStatus::SCAN_NOT_SUPPORTED_ON_THIS_OPERATING_CLASS_AND_CHANNEL_ON_THIS_RADIO;
+                 auto db_status         = radio->channel_scan_results.find(chan_num);
+-                if (db_status != radio->channel_scan_results.end()) {
++                if (radio->has_ap() && db_status != radio->channel_scan_results.end()) {
+                     new_status = std::get<0>(db_status->second);
+                 }
+                 channel_vector.emplace_back(sChannel(chan_num, new_status));
+@@ -1178,7 +1187,7 @@
+             LOG(ERROR) << "Failed to get radio entry for MAC: " << radio_mac;
+             return false;
+         }
+-        const auto radio_iface = radio->front.iface_name;
++        const auto radio_iface = radio->iface_name();
+         std::chrono::system_clock::time_point last_scan;
+         bool prev_timestamp_entry_found = false;
+ 
+@@ -1287,7 +1296,7 @@
+                 if (new_request->radio_scans->radio_mac == extension_entry.radio_mac) {
+                     new_request->radio_scans->dwell_time = extension_entry.dwell_time_ms;
+                     LOG(DEBUG) << "Set Dwell-time " << extension_entry.dwell_time_ms
+-                               << " ms for radio: " << radio->front.iface_name;
++                               << " ms for radio: " << radio->iface_name();
+                 }
+             }
+             return true;
+@@ -1372,7 +1381,7 @@
+                 for (const auto operating_class_20MHz_channel : operating_class_20MHz_channels) {
+                     LOG(DEBUG) << "Checking if 20MHz channel " << operating_class_20MHz_channel
+                                << " is supported";
+-                    if (db_radio->channels_list.find(channel_number) ==
++                    if (!db_radio->has_ap() || db_radio->channels_list.find(channel_number) ==
+                         db_radio->channels_list.end()) {
+                         LOG(DEBUG) << "20MHz channel " << operating_class_20MHz_channel
+                                    << " is not supported";
+@@ -1396,6 +1405,7 @@
+         for (const auto channel_number : channel_list) {
+             if (!son::wireless_utils::is_channel_in_operating_class(operating_class,
+                                                                     channel_number) ||
++                !db_radio->has_ap() ||
+                 db_radio->channels_list.find(channel_number) == db_radio->channels_list.end()) {
+                 LOG(DEBUG) << "Channel #" << channel_number << " in operating class #"
+                            << operating_class << " is not supported on this radio";
+@@ -1484,7 +1494,7 @@
+         LOG(ERROR) << "Failed to get radio entry for MAC: " << radio_mac;
+         return false;
+     }
+-    const auto radio_iface = radio->front.iface_name;
++    const auto radio_iface = radio->iface_name();
+     std::vector<uint8_t> operating_classes;
+     /* We can perform a full scan on all the supported operating classes
+        But the below operating classes list were chosed for certification
+@@ -1549,7 +1559,8 @@
+         for (auto scan_elem : scan_map) {
+             for (auto chan : std::get<1>(scan_elem)) {
+                 radio->channel_scan_results[chan] =
+-                    std::make_tuple(eScanStatus::SCAN_NOT_COMPLETED, now,
++                    std::make_tuple(radio->has_ap() ? eScanStatus::SCAN_NOT_COMPLETED :
++                                        eScanStatus::SCAN_NOT_SUPPORTED_ON_THIS_OPERATING_CLASS_AND_CHANNEL_ON_THIS_RADIO, now,
+                                     std::vector<beerocks_message::sChannelScanResults>{});
+             }
+         }
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.cpp
+@@ -201,6 +201,18 @@
+         break;
+     }
+ 
++    case STA_CHANNEL_SWITCH: {
++        if (!event_obj) break;
++        const auto &iface = *static_cast<const std::string *>(event_obj);
++        auto db = AgentDB::get();
++        auto radio = db->radio(iface);
++        if (!radio || radio->has_ap()) break;
++        build_channel_preference_report(radio->radio_uid());
++        if (db->controller_info.bridge_mac != net::network_utils::ZERO_MAC) {
++            send_operating_channel_report(radio->radio_uid());
++        }
++        break;
++    }
+     default: {
+         LOG(DEBUG) << "Message handler doesn't exists for event type " << event_enum_value;
+         break;
+@@ -249,6 +261,11 @@
+     auto db = AgentDB::get();
+ 
+     for (const auto radio : db->get_radios_list()) {
++        if (!radio->has_ap()) {
++            // Capabilities came from its physical radio; there is no AP-manager query.
++            build_channel_preference_report(radio->radio_uid());
++            continue;
++        }
+         LOG(DEBUG) << "Sending ACTION_BACKHAUL_CHANNELS_LIST_REQUEST to radio "
+                    << radio->front.iface_mac;
+ 
+@@ -283,8 +300,10 @@
+         auto eht_operations_radio = std::get<1>(eht_ops_tlv.radio_entries(radio_idx));
+ 
+         auto radio = db->get_radio_by_mac(eht_operations_radio.ruid(), AgentDB::eMacType::RADIO);
+-        if (!radio) {
+-            LOG(ERROR) << "Radio not found: " << eht_operations_radio.ruid();
++        if (!radio || !radio->has_ap()) {
++            if (radio) m_pending_selection.requests[radio->radio_uid()].response_code =
++                wfa_map::tlvChannelSelectionResponse::DECLINE_PREVENT_OPERATION_OF_BACKHAUL_LINK;
++            LOG(ERROR) << "AP radio not found: " << eht_operations_radio.ruid();
+             continue;
+         }
+ 
+@@ -373,6 +392,11 @@
+ 
+         const auto &radio_mac = channel_preference_tlv->radio_uid();
+         auto &radio_request   = m_pending_selection.requests[radio_mac];
++        auto radio = db->get_radio_by_mac(radio_mac);
++        if (radio && !radio->has_ap()) {
++            radio_request.response_code = wfa_map::tlvChannelSelectionResponse::DECLINE_PREVENT_OPERATION_OF_BACKHAUL_LINK;
++            continue;
++        }
+ 
+         if (!store_controller_preference(channel_preference_tlv)) {
+             LOG(ERROR) << "Failed to store controller preference!";
+@@ -422,6 +446,11 @@
+             return;
+         }
+ 
++        if (!radio->has_ap()) {
++            m_pending_selection.requests[radio->radio_uid()].response_code =
++                wfa_map::tlvChannelSelectionResponse::DECLINE_PREVENT_OPERATION_OF_BACKHAUL_LINK;
++            continue;
++        }
+         auto wifi6_caps =
+             reinterpret_cast<beerocks::net::sWIFI6Capabilities *>(&radio->wifi6_capability);
+         if (!wifi6_caps->spatial_reuse) {
+@@ -468,7 +497,7 @@
+         LOG(DEBUG) << "Radio " << radio_mac << " is returning " << response_code
+                    << " as a response!";
+ 
+-        if (request_iter == m_pending_selection.requests.end()) {
++        if (request_iter == m_pending_selection.requests.end() || !radio->has_ap()) {
+             continue;
+         }
+         m_pending_selection.requests[radio_mac].chan_sel_state = NO_CHANNEL_SWITCH;
+@@ -510,7 +539,7 @@
+         const auto &radio_mac = request_iter.first;
+         auto radio            = db->get_radio_by_mac(radio_mac);
+ 
+-        if (!radio) {
++        if (!radio || !radio->has_ap()) {
+             LOG(ERROR) << "Radio " << radio_mac << " does not exist on the db";
+             continue;
+         }
+@@ -1183,7 +1212,7 @@
+         const auto oper_class_bw_orig   = oper_class.second.band;
+         auto oper_class_bw              = oper_class_bw_orig;
+ 
+-        if (radio->wifi_channel.get_freq_type() !=
++        if (radio->frequency_band() !=
+             son::wireless_utils::which_freq_op_cls(oper_class_num)) {
+             // Operating Class not part of the current radio, skip.
+             continue;
+@@ -1462,6 +1491,11 @@
+         return false;
+     }
+ 
++    if (!radio->has_ap()) {
++        radio_request.response_code = wfa_map::tlvChannelSelectionResponse::DECLINE_PREVENT_OPERATION_OF_BACKHAUL_LINK;
++        return false;
++    }
++
+     LOG(DEBUG) << std::dec << "received tlvTransmitPowerLimit " << (int)new_tx_power_limit_dbm;
+     /**
+      * Currently it is assumed that if a new TX Power Limit was requested we need to send it to
+@@ -1472,7 +1506,7 @@
+     radio_request.outgoing_request.channel        = radio->wifi_channel.get_channel();
+     radio_request.outgoing_request.center         = 0;
+     radio_request.outgoing_request.bandwidth      = radio->wifi_channel.get_bandwidth();
+-    radio_request.outgoing_request.freq_type      = radio->wifi_channel.get_freq_type();
++    radio_request.outgoing_request.freq_type      = radio->frequency_band();
+     radio_request.outgoing_request.tx_limit       = new_tx_power_limit_dbm;
+     radio_request.outgoing_request.tx_limit_valid = true;
+     radio_request.power_switch_received           = true;
+@@ -1759,7 +1793,7 @@
+         return sSelectedChannel();
+     }
+ 
+-    auto freq_type = radio->wifi_channel.get_freq_type();
++    auto freq_type = radio->frequency_band();
+     if (radio->wifi_channel.is_empty()) {
+         LOG(WARNING) << "wifi channel is empty";
+         freq_type = beerocks::FREQ_5G;
+@@ -2099,7 +2133,7 @@
+         if (!radio) {
+             continue;
+         }
+-        if (band != eFreqType::FREQ_UNKNOWN && radio->wifi_channel.get_freq_type() != band) {
++        if (band != eFreqType::FREQ_UNKNOWN && radio->frequency_band() != band) {
+             continue;
+         }
+         if (radio->statuses.channel_scan_in_progress) {
+@@ -2313,14 +2347,14 @@
+             break;
+         }
+ 
+-        auto freq_type = radio->wifi_channel.get_freq_type();
+-        if (radio->wifi_channel.get_freq_type() != beerocks::eFreqType::FREQ_5G) {
++        auto freq_type = radio->frequency_band();
++        if (radio->frequency_band() != beerocks::eFreqType::FREQ_5G) {
+             LOG(ERROR) << "On ZWDFS request the frequency "
+                        << beerocks::utils::convert_frequency_type_to_string(freq_type)
+                        << " must be 5G";
+         }
+ 
+-        if (radio_scan_in_progress(radio->wifi_channel.get_freq_type())) {
++        if (radio_scan_in_progress(radio->frequency_band())) {
+             LOG(INFO) << "Pause ZWDFS flow until background scan is finished";
+             break;
+         }
+@@ -2431,7 +2465,7 @@
+             break;
+         }
+ 
+-        auto freq_type = radio->wifi_channel.get_freq_type();
++        auto freq_type = radio->frequency_band();
+         if (freq_type != beerocks::eFreqType::FREQ_5G) {
+             LOG(ERROR) << "On ZWDFS the frequency "
+                        << beerocks::utils::convert_frequency_type_to_string(freq_type)
+--- a/agent/src/beerocks/slave/tasks/channel_selection_task.h
++++ b/agent/src/beerocks/slave/tasks/channel_selection_task.h
+@@ -34,7 +34,7 @@
+ 
+     void work() override;
+ 
+-    enum eEvent : uint8_t { AP_DISABLED, AP_ENABLED };
++    enum eEvent : uint8_t { AP_DISABLED, AP_ENABLED, STA_CHANNEL_SWITCH };
+ 
+     void handle_event(uint8_t event_enum_value, const void *event_obj) override;
+ 
+--- a/agent/src/beerocks/slave/tasks/coordinated_cac_task.cpp
++++ b/agent/src/beerocks/slave/tasks/coordinated_cac_task.cpp
+@@ -160,7 +160,7 @@
+                 auto radio =
+                     db->get_radio_by_mac(m_cac_request_radio.radio_uid, AgentDB::eMacType::RADIO);
+ 
+-                if (!radio) {
++                if (!radio || !radio->has_ap()) {
+                     LOG(ERROR) << "Failed to find database record for interface: " << m_ifname;
+                     transition.change_destination(fsm_state::ERROR);
+                     return true;
+--- a/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
++++ b/agent/src/beerocks/slave/tasks/link_metrics_collection_task.cpp
+@@ -752,6 +752,7 @@
+     //make sure we insert all radios, even with if no stations are monitored on them
+     //reason: a query with no stations means remove all monitored stations, if any
+     for (auto &radio : db->get_radios_list()) {
++        if (!radio->has_ap()) continue;
+         map_stations_per_radio.insert(std::make_pair(
+             radio->front.iface_mac, std::unordered_map<uint8_t, std::list<sMacAddr>>()));
+     }
+@@ -771,6 +772,7 @@
+                 count)); //1 channel that might contains a list of un_stations
+         auto channel = one_channel_params.channel_number();
+         for (auto &radio : db->get_radios_list()) {
++        if (!radio->has_ap()) continue;
+             //The telemtry does not contain any reference to the radio, thus the need to detect it using channel and operating_class
+             if (radio->channels_list.find(channel) != radio->channels_list.end() &&
+                 radio->wifi_channel.get_freq_type() ==
+@@ -895,7 +897,7 @@
+     pending_responses = 0;
+ 
+     for (const auto radio : db->get_radios_list()) {
+-        if (!radio) {
++        if (!radio || !radio->has_ap()) {
+             continue;
+         }
+ 
+--- a/agent/src/beerocks/slave/tasks/proxy_agent_dpp_task.cpp
++++ b/agent/src/beerocks/slave/tasks/proxy_agent_dpp_task.cpp
+@@ -39,6 +39,7 @@
+ {
+     auto db = AgentDB::get();
+     for (auto radio : db->get_radios_list()) {
++        if (!radio->has_ap()) continue;
+         auto ap_manager_fd = m_btl_ctx.get_ap_manager_fd(radio->front.iface_name);
+         if (!m_btl_ctx.forward_cmdu_to_uds(ap_manager_fd, cmdu_rx)) {
+             LOG(ERROR) << "Failed to forward message to ap_manager";
+@@ -79,6 +80,7 @@
+             // TO DO: handle DPP authentication request message
+             // forward proxy_encap_dpp messages originating from controller to ap_manager.
+             for (auto radio : db->get_radios_list()) {
++        if (!radio->has_ap()) continue;
+                 auto ap_manager_fd = m_btl_ctx.get_ap_manager_fd(radio->front.iface_name);
+                 if (!m_btl_ctx.forward_cmdu_to_uds(ap_manager_fd, cmdu_rx)) {
+                     LOG(ERROR) << "Failed to forward message to ap_manager";
+--- a/agent/src/beerocks/slave/tasks/topology_task.cpp
++++ b/agent/src/beerocks/slave/tasks/topology_task.cpp
+@@ -638,7 +638,7 @@
+         }
+ 
+         auto radio_ifname =
+-            radio->back.iface_name.empty() ? radio->front.iface_name : radio->back.iface_name;
++            radio->back.iface_name.empty() ? radio->iface_name() : radio->back.iface_name;
+ 
+         ieee1905_1::eMediaTypeGroup media_type_group = ieee1905_1::eMediaTypeGroup::IEEE_802_11;
+         ieee1905_1::eMediaType media_type            = ieee1905_1::eMediaType::UNKNOWN_MEDIA;
+--- a/agent/src/beerocks/slave/tlvf_utils.cpp
++++ b/agent/src/beerocks/slave/tlvf_utils.cpp
+@@ -157,13 +157,13 @@
+     radio_basic_caps->maximum_number_of_bsss_supported() =
+         (radio_max_bss > 0) ? radio_max_bss : num_bsses;
+ 
+-    LOG(DEBUG) << "Filling Supported operating classes on radio " << radio->front.iface_name
++    LOG(DEBUG) << "Filling Supported operating classes on radio " << radio->iface_name()
+                << " (band type: "
+                << beerocks::utils::convert_frequency_type_to_string(
+-                      radio->wifi_channel.get_freq_type())
++                      radio->frequency_band())
+                << "):";
+     auto operating_classes = son::wireless_utils::get_operating_classes_of_freq_type(
+-        radio->wifi_channel.get_freq_type());
++        radio->frequency_band());
+ 
+     for (auto op_class : operating_classes) {
+         auto non_oper_channels =
+@@ -233,7 +233,7 @@
+         std::vector<std::pair<uint8_t, uint8_t>> operating_list = {};
+ 
+         auto operating_classes = son::wireless_utils::get_operating_classes_of_freq_type(
+-            radio->wifi_channel.get_freq_type());
++            radio->frequency_band());
+ 
+         auto operating_class =
+             son::wireless_utils::get_operating_class_by_channel(radio->wifi_channel);
+@@ -249,9 +249,9 @@
+             if (son::wireless_utils::is_operating_class_using_central_channel(*it)) {
+                 std::map<uint8_t, std::map<beerocks::eWiFiBandwidth, son::wireless_utils::sChannel>>
+                     channels_table;
+-                if (radio->wifi_channel.get_freq_type() == beerocks::eFreqType::FREQ_5G) {
++                if (radio->frequency_band() == beerocks::eFreqType::FREQ_5G) {
+                     channels_table = son::wireless_utils::channels_table_5g;
+-                } else if (radio->wifi_channel.get_freq_type() == beerocks::eFreqType::FREQ_6G) {
++                } else if (radio->frequency_band() == beerocks::eFreqType::FREQ_6G) {
+                     channels_table = son::wireless_utils::channels_table_6g;
+                 }
+ 
+@@ -260,7 +260,7 @@
+                     LOG(ERROR) << "Failed find " << radio->wifi_channel.get_channel()
+                                << " channel in "
+                                << beerocks::utils::convert_frequency_type_to_string(
+-                                      radio->wifi_channel.get_freq_type())
++                                      radio->frequency_band())
+                                << " channels table.";
+                     return {};
+                 }
+@@ -275,7 +275,7 @@
+                     LOG(ERROR) << "Failed find bandwidth of channel "
+                                << radio->wifi_channel.get_channel() << " in "
+                                << beerocks::utils::convert_frequency_type_to_string(
+-                                      radio->wifi_channel.get_freq_type())
++                                      radio->frequency_band())
+                                << " channels table.";
+                     continue;
+                 }
+@@ -393,7 +393,7 @@
+     auto db = AgentDB::get();
+ 
+     for (auto radio : db->get_radios_list()) {
+-        if (!radio) {
++        if (!radio || !radio->has_ap()) {
+             LOG(ERROR) << "Error fetching radio";
+             continue;
+         }
+@@ -468,12 +468,12 @@
+ 
+     // prepare supported operating classes
+     auto operating_classes = son::wireless_utils::get_operating_classes_of_freq_type(
+-        radio->wifi_channel.get_freq_type());
++        radio->frequency_band());
+ 
+     if (operating_classes.empty()) {
+         LOG(ERROR) << "Error fetching operating classes for "
+                    << tlvf::mac_to_string(radio->front.iface_mac) << " and frequency type "
+-                   << int(radio->wifi_channel.get_freq_type());
++                   << int(radio->frequency_band());
+         return false;
+     }
+ 
+--- a/common/beerocks/bwl/include/bwl/nl80211_client.h
++++ b/common/beerocks/bwl/include/bwl/nl80211_client.h
+@@ -226,6 +226,7 @@
+          * Set to true if NL80211_BAND_ATTR_HT_CAPA attribute is included in response.
+          */
+         bool ht_supported = false;
++        bool ht_mcs_valid = false;
+ 
+         /**
+          * Value of NL80211_BAND_ATTR_HT_CAPA, see iw/util.c print_ht_capability() as a bit
+@@ -237,13 +238,14 @@
+          * Value of NL80211_BAND_ATTR_HT_MCS_SET, see iw/util.c print_ht_mcs() as a byte
+          * interpretation example.
+          */
+-        uint8_t ht_mcs_set[ht_mcs_set_size];
++        uint8_t ht_mcs_set[ht_mcs_set_size]{};
+ 
+         /**
+          * Is VHT supported flag.
+          * Set to true if NL80211_BAND_ATTR_VHT_CAPA attribute is included in response.
+          */
+         bool vht_supported = false;
++        bool vht_mcs_valid = false;
+ 
+         /**
+          * Value of NL80211_BAND_ATTR_VHT_CAPA, see iw/util.c print_vht_info() as a bit
+@@ -255,18 +257,20 @@
+          * Value of NL80211_BAND_ATTR_VHT_MCS_SET, see iw/util.c print_vht_info() as a byte
+          * interpretation example.
+          */
+-        uint8_t vht_mcs_set[vht_mcs_set_size];
++        uint8_t vht_mcs_set[vht_mcs_set_size]{};
+ 
+         /**
+          * Is HE supported flag.
+          * Set to true if NL80211_BAND_ATTR_IFTYPE_DATA attribute is included in response.
+          */
+         bool he_supported = false;
++        bool he_mcs_valid = false;
++        bool he_data_valid = false;
+ 
+         /**
+          * Value of NL80211_BAND_IFTYPE_ATTR_HE_CAP_MCS_SET, see iw/util.c.
+          */
+-        uint8_t he_mcs_set[he_mcs_set_size];
++        uint8_t he_mcs_set[he_mcs_set_size]{};
+ 
+         /**
+ 	 * Information obtained with NL80211_BAND_ATTR_IFTYPE_DATA command through a NL80211 socket.
+@@ -287,7 +291,7 @@
+ 	     */
+             uint8_t he_mcs_nss_set[12];
+             uint8_t optional[25];
+-        } he;
++        } he{};
+ 
+         uint8_t ext_capability[15];
+ 
+@@ -339,6 +343,56 @@
+ 
+             return max_bandwith;
+         }
++
++        /** Convert native MCS maps and HT/VHT attributes to the existing Multi-AP wire fields. */
++        static uint8_t mcs_map_nss(const uint8_t *map)
++        {
++            const uint16_t bits = map[0] | (uint16_t(map[1]) << 8);
++            uint8_t streams = 0;
++            for (uint8_t i = 0; i < 8; ++i) {
++                if (((bits >> (2 * i)) & 3) != 3) streams = i + 1;
++            }
++            return streams;
++        }
++
++        bool get_multi_ap_ht_capability(uint8_t &value) const
++        {
++            value = 0;
++            if (!ht_supported) return true;
++            if (!ht_mcs_valid) return false;
++            uint8_t rx = 0;
++            for (uint8_t i = 0; i < 4; ++i) {
++                if (ht_mcs_set[i]) rx = i + 1;
++            }
++            if (!rx) return false;
++            // Defined unequal Tx MCS set: bits2-3 encode maximum Tx streams minus1.
++            const uint8_t tx = (ht_mcs_set[12] & 3) == 3 ?
++                ((ht_mcs_set[12] >> 2) & 3) + 1 : rx;
++            value = ((tx - 1) << 6) | ((rx - 1) << 4) |
++                (bool(ht_capability & (1 << 5)) << 3) |
++                (bool(ht_capability & (1 << 6)) << 2) |
++                (bool(ht_capability & (1 << 1)) << 1);
++            return true;
++        }
++
++        bool get_multi_ap_vht_capability(uint16_t &value) const
++        {
++            value = 0;
++            if (!vht_supported) return true;
++            if (!vht_mcs_valid) return false;
++            const auto rx = mcs_map_nss(vht_mcs_set), tx = mcs_map_nss(vht_mcs_set + 4);
++            if (!rx || !tx) return false;
++            const auto width = (vht_capability >> 2) & 3;
++            if (width == 3) return false;
++            value = ((tx - 1) << 13) | ((rx - 1) << 10) |
++                (bool(vht_capability & (1 << 5)) << 9) |
++                (bool(vht_capability & (1 << 6)) << 8) |
++                ((width == 2) << 7) | ((width == 1 || width == 2) << 6) |
++                (bool(vht_capability & (1 << 11)) << 5) |
++                (bool(vht_capability & (1 << 19)) << 4);
++            return true;
++        }
++
+     };
+ 
+     /**
+@@ -354,6 +408,20 @@
+          */
+         std::vector<band_info> bands;
+     };
++
++    struct physical_radio {
++        uint32_t index = 0;
++        std::string name;
++        std::string device_path;
++        sMacAddr permanent_mac{};
++        bool supports_ap = false;
++        uint32_t max_ap_interfaces = 0;
++    };
++
++    // Optional native inventory: implementations without this provider keep
++    // their existing behavior and cannot admit a standalone STA radio.
++    virtual bool get_physical_radios(std::vector<physical_radio> &) { return false; }
++    virtual bool get_radio_info_by_phy(uint32_t, radio_info &) { return false; }
+ 
+     /**
+      * @brief Station information
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -383,7 +383,9 @@
+     // state. So, to read the latest value, we need to refresh data on every call.
+ 
+     nl80211_client::radio_info radio_info;
+-    if (!m_nl80211_client->get_radio_info(get_iface_name(), radio_info)) {
++    nl80211_client::interface_info endpoint{};
++    if (!m_nl80211_client->get_interface_info(get_iface_name(), endpoint) ||
++        !m_nl80211_client->get_radio_info_by_phy(endpoint.wiphy, radio_info)) {
+         LOG(ERROR) << "Unable to read radio info for interface " << m_radio_info.iface_name;
+         return false;
+     }
+@@ -518,14 +520,25 @@
+     if (band_info_it != radio_info.bands.end()) {
+         m_radio_info.max_bandwidth = band_info_it->get_max_bandwidth();
+         m_radio_info.ht_supported  = band_info_it->ht_supported;
+-        m_radio_info.ht_capability = band_info_it->ht_capability;
++        if (!band_info_it->get_multi_ap_ht_capability(m_radio_info.ht_capability) ||
++            !band_info_it->get_multi_ap_vht_capability(m_radio_info.vht_capability)) {
++            LOG(ERROR) << "Incomplete HT/VHT physical radio capability data";
++            return false;
++        }
+         std::copy_n(band_info_it->ht_mcs_set, m_radio_info.ht_mcs_set.size(),
+                     m_radio_info.ht_mcs_set.begin());
+         m_radio_info.vht_supported  = band_info_it->vht_supported;
+-        m_radio_info.vht_capability = band_info_it->vht_capability;
+-        // TODO: Sizes are changed, needs to be reworked!
+-        // std::copy_n(band_info_it->vht_mcs_set, m_radio_info.vht_mcs_set.size(),
+-        //             m_radio_info.vht_mcs_set.begin());
++        std::copy_n(band_info_it->vht_mcs_set, m_radio_info.vht_mcs_set.size(),
++                    m_radio_info.vht_mcs_set.begin());
++        if (band_info_it->he_supported &&
++            (!band_info_it->he_mcs_valid || !band_info_it->he_data_valid ||
++             !band_info_it->mcs_map_nss(band_info_it->he_mcs_set) ||
++             !band_info_it->mcs_map_nss(band_info_it->he_mcs_set + 2))) {
++            LOG(ERROR) << "Incomplete HE physical radio capability data";
++            return false;
++        }
++        std::copy_n(band_info_it->he_mcs_set, m_radio_info.he_mcs_set.size(),
++                    m_radio_info.he_mcs_set.begin());
+         m_radio_info.he_supported     = band_info_it->he_supported;
+         m_radio_info.he_capability    = band_info_it->he_capability;
+         m_radio_info.wifi6_capability = band_info_it->wifi6_capability;
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
+@@ -33,6 +33,11 @@
+  */
+ 
+ #include "nl80211_client_impl.h"
++
++#include <limits.h>
++#include <cstdlib>
++#include <map>
++#include <set>
+ 
+ #include <bcl/beerocks_defines.h>
+ #include <bcl/beerocks_utils.h>
+@@ -218,7 +223,87 @@
+         });
+ }
+ 
+-bool nl80211_client_impl::get_radio_info(const std::string &interface_name, radio_info &radio_info)
++bool nl80211_client_impl::get_physical_radios(std::vector<physical_radio> &radios)
++{
++    std::map<uint32_t, physical_radio> found;
++    std::set<uint32_t> combinations;
++    radios.clear();
++    if (!m_socket) return false;
++    bool ok = m_socket->send_receive_msg(
++        NL80211_CMD_GET_WIPHY, NLM_F_DUMP,
++        [](struct nl_msg *msg) {
++            nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
++            return true;
++        },
++        [&](struct nl_msg *msg) {
++            struct nlattr *tb[NL80211_ATTR_MAX + 1]{};
++            auto *gnlh = static_cast<genlmsghdr *>(nlmsg_data(nlmsg_hdr(msg)));
++            if (nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
++                          genlmsg_attrlen(gnlh, 0), nullptr) || !tb[NL80211_ATTR_WIPHY]) return;
++            auto index = nla_get_u32(tb[NL80211_ATTR_WIPHY]);
++            auto &phy = found[index];
++            phy.index = index;
++            if (tb[NL80211_ATTR_WIPHY_NAME]) phy.name = nla_get_string(tb[NL80211_ATTR_WIPHY_NAME]);
++            if (tb[NL80211_ATTR_MAC] && nla_len(tb[NL80211_ATTR_MAC]) == ETH_ALEN)
++                memcpy(phy.permanent_mac.oct, nla_data(tb[NL80211_ATTR_MAC]), ETH_ALEN);
++            if (tb[NL80211_ATTR_SUPPORTED_IFTYPES]) {
++                struct nlattr *type;
++                int remaining;
++                nla_for_each_nested(type, tb[NL80211_ATTR_SUPPORTED_IFTYPES], remaining) {
++                    if (nla_type(type) == NL80211_IFTYPE_AP) phy.supports_ap = true;
++                }
++            }
++            if (!tb[NL80211_ATTR_INTERFACE_COMBINATIONS]) return;
++            combinations.insert(index);
++            struct nlattr *combination;
++            int remaining;
++            nla_for_each_nested(combination, tb[NL80211_ATTR_INTERFACE_COMBINATIONS], remaining) {
++                struct nlattr *comb[NUM_NL80211_IFACE_COMB]{};
++                if (nla_parse_nested(comb, MAX_NL80211_IFACE_COMB, combination, nullptr) ||
++                    !comb[NL80211_IFACE_COMB_LIMITS] || !comb[NL80211_IFACE_COMB_MAXNUM]) continue;
++                auto total = nla_get_u32(comb[NL80211_IFACE_COMB_MAXNUM]);
++                struct nlattr *limit;
++                int rem_limit;
++                nla_for_each_nested(limit, comb[NL80211_IFACE_COMB_LIMITS], rem_limit) {
++                    struct nlattr *attrs[NUM_NL80211_IFACE_LIMIT]{};
++                    if (nla_parse_nested(attrs, MAX_NL80211_IFACE_LIMIT, limit, nullptr) ||
++                        !attrs[NL80211_IFACE_LIMIT_MAX] || !attrs[NL80211_IFACE_LIMIT_TYPES]) continue;
++                    struct nlattr *type;
++                    int rem_type;
++                    nla_for_each_nested(type, attrs[NL80211_IFACE_LIMIT_TYPES], rem_type) {
++                        if (nla_type(type) == NL80211_IFTYPE_AP)
++                            phy.max_ap_interfaces = std::max(phy.max_ap_interfaces,
++                                std::min(total, nla_get_u32(attrs[NL80211_IFACE_LIMIT_MAX])));
++                    }
++                }
++            }
++        });
++    if (!ok) return false;
++    for (auto &entry : found) {
++        auto &phy = entry.second;
++        char path[PATH_MAX];
++        auto link = "/sys/class/ieee80211/" + phy.name + "/device";
++        if (phy.name.empty() || !realpath(link.c_str(), path)) continue;
++        phy.device_path = path;
++        // Without combinations, nl80211 permits one interface of a supported type.
++        if (phy.supports_ap && !combinations.count(phy.index)) phy.max_ap_interfaces = 1;
++        radios.push_back(std::move(phy));
++    }
++    return !radios.empty();
++}
++
++bool nl80211_client_impl::get_radio_info(const std::string &interface_name, radio_info &info)
++{
++    auto index = if_nametoindex(interface_name.c_str());
++    return index && read_radio_info(index, 0, info);
++}
++
++bool nl80211_client_impl::get_radio_info_by_phy(uint32_t index, radio_info &info)
++{
++    return read_radio_info(0, index, info, true);
++}
++
++bool nl80211_client_impl::read_radio_info(uint32_t iface_index, uint32_t phy, radio_info &radio_info, bool ap_only)
+ {
+     int last_band    = -1;
+     bool width_40    = false;
+@@ -228,25 +313,18 @@
+     int mcs_nss_size = 0;
+ 
+     radio_info = {};
++    uint8_t ext_capability[15]{};
+ 
+     if (!m_socket) {
+         LOG(ERROR) << "Socket is NULL!";
+-        return false;
+-    }
+-
+-    // Get the interface index for given interface name
+-    int iface_index = if_nametoindex(interface_name.c_str());
+-    if (0 == iface_index) {
+-        LOG(ERROR) << "Failed to read the index of interface " << interface_name << ": "
+-                   << strerror(errno);
+-
+         return false;
+     }
+ 
+     return m_socket.get()->send_receive_msg(
+         NL80211_CMD_GET_WIPHY, NLM_F_DUMP,
+         [&](struct nl_msg *msg) -> bool {
+-            nla_put_u32(msg, NL80211_ATTR_IFINDEX, iface_index);
++            if (iface_index) nla_put_u32(msg, NL80211_ATTR_IFINDEX, iface_index);
++            else nla_put_u32(msg, NL80211_ATTR_WIPHY, phy);
+             nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
+ 
+             return true;
+@@ -267,15 +345,10 @@
+ 	     * Multiple BSSID capability is set in the 6th bit of 3rd byte of the
+ 	     * @WLAN_EID_EXT_CAPABILITY information element.
+ 	     */
+-            uint8_t ext_capability[15] = {};
+             if (tb[NL80211_ATTR_EXT_CAPA]) {
+                 size_t actual_length = nla_len(tb[NL80211_ATTR_EXT_CAPA]);
+-                if (radio_info.bands.empty()) {
+-                    LOG(ERROR) << "Array of bands is empty";
+-                    return;
+-                }
+-
+-                memcpy(ext_capability, nla_data(tb[NL80211_ATTR_EXT_CAPA]), actual_length);
++                memcpy(ext_capability, nla_data(tb[NL80211_ATTR_EXT_CAPA]),
++                       std::min(actual_length, sizeof(ext_capability)));
+             }
+ #endif
+ 
+@@ -335,6 +408,7 @@
+                     if (actual_length <= expected_length) {
+                         memcpy(band.ht_mcs_set, nla_data(tb_band[NL80211_BAND_ATTR_HT_MCS_SET]),
+                                actual_length);
++                        band.ht_mcs_valid = actual_length == sizeof(band.ht_mcs_set);
+                     } else {
+                         LOG(DEBUG) << "Invalid length for NL80211_BAND_ATTR_HT_MCS_SET "
+                                       "attribute. Expected length: "
+@@ -347,7 +421,6 @@
+                     band.vht_capability = nla_get_u32(tb_band[NL80211_BAND_ATTR_VHT_CAPA]);
+ 
+                     width_80 = true;
+-                    mcs_nss_size += 4;
+ 
+                     switch ((band.vht_capability >> 2) & 3) {
+                     case 2:
+@@ -367,6 +440,7 @@
+                     if (actual_length <= expected_length) {
+                         memcpy(band.vht_mcs_set, nla_data(tb_band[NL80211_BAND_ATTR_VHT_MCS_SET]),
+                                actual_length);
++                        band.vht_mcs_valid = actual_length >= 8;
+                     } else {
+                         LOG(DEBUG) << "Invalid length for NL80211_BAND_ATTR_VHT_MCS_SET "
+                                       "attribute. Expected length: "
+@@ -377,7 +451,7 @@
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 1)
+                 // Refer linux/ieee80211.h for each bit representation.
+                 if (tb_band[NL80211_BAND_ATTR_IFTYPE_DATA]) {
+-                    band.he_supported = true;
++                    band.he_supported = !ap_only;
+ 
+                     // If HE is supported UL and DL-OFDMA RTS and MU-RTS are mandatory.
+                     band.he_capability    = band.he_capability | (3 << 1);
+@@ -393,11 +467,28 @@
+                         nla_parse(tb_iftype, NL80211_BAND_IFTYPE_ATTR_MAX,
+                                   static_cast<nlattr *>(nla_data(nl_band)), nla_len(nl_band), NULL);
+ 
++                        if (ap_only) {
++                            bool ap = false;
++                            if (tb_iftype[NL80211_BAND_IFTYPE_ATTR_IFTYPES]) {
++                                struct nlattr *type;
++                                int remaining;
++                                nla_for_each_nested(type, tb_iftype[NL80211_BAND_IFTYPE_ATTR_IFTYPES], remaining) {
++                                    if (nla_type(type) == NL80211_IFTYPE_AP) ap = true;
++                                }
++                            }
++                            if (!ap) continue;
++                            band.he_supported = true;
++                        }
++                        band.he_data_valid = tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC] &&
++                            nla_len(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC]) == sizeof(band.he.he_mac_capab_info) &&
++                            tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_PHY] &&
++                            nla_len(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_PHY]) == sizeof(band.he.he_phy_capab_info);
++
+                         //Check whether TWT Requester and Responder are supported.
+                         if (tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC]) {
+                             memcpy(band.he.he_mac_capab_info,
+                                    nla_data(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC]),
+-                                   nla_len(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC]));
++                                   std::min<size_t>(nla_len(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_MAC]), sizeof(band.he.he_mac_capab_info)));
+ 
+                             if (band.he.he_mac_capab_info[0] & 2) {
+                                 band.wifi6_capability = band.wifi6_capability | (1 << 3);
+@@ -410,13 +501,15 @@
+                         if (tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_PHY]) {
+                             memcpy(band.he.he_phy_capab_info,
+                                    nla_data(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_PHY]),
+-                                   nla_len(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_PHY]));
++                                   std::min<size_t>(nla_len(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_PHY]), sizeof(band.he.he_phy_capab_info)));
+ 
+                             /**
+ 			     * check whether the 80_plus_80 and 160 mhz are supported.
+ 			     * if both are supported set 8th and 9th bit.
+ 			     * if only 160 supported set 8th.
+ 			     */
++                            // HE always has the <=80MHz RX/TX maps, including 2.4GHz without VHT.
++                            mcs_nss_size = 4;
+                             switch ((band.he.he_phy_capab_info[0] >> 3) & 3) {
+                             case 3:
+                                 band.he_capability    = band.he_capability | (1 << 8);
+@@ -505,7 +598,12 @@
+                             int he_rx_nss, he_tx_nss, he_mcs;
+                             memcpy(band.he_mcs_set,
+                                    nla_data(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_MCS_SET]),
+-                                   nla_len(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_MCS_SET]));
++                                   std::min<size_t>(nla_len(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_MCS_SET]), sizeof(band.he_mcs_set)));
++                            const auto length = nla_len(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_MCS_SET]);
++                            const auto phy = band.he.he_phy_capab_info[0];
++                            const int expected = 4 + ((phy & (1 << 3)) ? 4 : 0) +
++                                ((phy & (1 << 4)) ? 4 : 0);
++                            band.he_mcs_valid = length == expected;
+ 
+                             uint16_t he_rx_mcs_map = band.he_mcs_set[0] | (band.he_mcs_set[1] << 8);
+                             for (he_rx_nss = 8; he_rx_nss > 0; he_rx_nss--) {
+@@ -517,7 +615,7 @@
+                             }
+ 
+                             band.he_capability = band.he_capability | ((7 & (he_rx_nss - 1)) << 10);
+-                            band.wifi6_capability = band.wifi6_capability | (he_rx_nss << 24);
++                            band.wifi6_capability = band.wifi6_capability | (uint64_t(he_rx_nss) << 24);
+ 
+                             uint16_t he_tx_mcs_map = band.he_mcs_set[2] | (band.he_mcs_set[3] << 8);
+                             for (he_tx_nss = 8; he_tx_nss > 0; he_tx_nss--) {
+@@ -528,13 +626,13 @@
+                             }
+ 
+                             band.he_capability = band.he_capability | ((7 & (he_tx_nss - 1)) << 13);
+-                            band.wifi6_capability = band.wifi6_capability | (he_rx_nss << 28);
++                            band.wifi6_capability = band.wifi6_capability | (uint64_t(he_tx_nss) << 28);
+                         }
+ 
+                         if (tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_PPE]) {
+                             memcpy(band.he.optional,
+                                    nla_data(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_PPE]),
+-                                   nla_len(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_PPE]));
++                                   std::min<size_t>(nla_len(tb_iftype[NL80211_BAND_IFTYPE_ATTR_HE_CAP_PPE]), sizeof(band.he.optional)));
+                         }
+                         if (ext_capability[2] >> 6 & 1) {
+                             band.wifi6_capability = band.wifi6_capability | (1 << 5);
+--- a/common/beerocks/bwl/shared/nl80211_client_impl.h
++++ b/common/beerocks/bwl/shared/nl80211_client_impl.h
+@@ -75,6 +75,8 @@
+      * @return True on success and false otherwise.
+      */
+     virtual bool get_radio_info(const std::string &interface_name, radio_info &radio_info) override;
++    bool get_physical_radios(std::vector<physical_radio> &radios) override;
++    bool get_radio_info_by_phy(uint32_t index, radio_info &info) override;
+ 
+     /**
+      * @brief Gets station information.
+@@ -181,6 +183,7 @@
+                     const sMacAddr &bssid) override;
+ 
+ private:
++    bool read_radio_info(uint32_t ifindex, uint32_t phy, radio_info &info, bool ap_only = false);
+     /**
+      * NL80211 socket to send messages and receive responses to/from the WiFi driver.
+      */
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg_wifi_apply.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi_apply.cpp
+@@ -95,7 +95,7 @@
+     bool open() { return (context = ubus_connect(nullptr)) != nullptr; }
+     void bind(const std::string &section) { anchor = section; }
+ 
+-    bool read(Sections &sections)
++    bool read(Sections &sections, const char *package_name = "wireless")
+     {
+         auto cursor = uci_alloc_context();
+         if (!cursor) {
+@@ -103,12 +103,12 @@
+         }
+         uci_element *element, *next;
+         uci_foreach_element_safe(&cursor->delta_path, next, element) {
+-            uci_list_del(&element->list);
+             free(element->name);
+             free(element);
+         }
++        cursor->delta_path.next = cursor->delta_path.prev = &cursor->delta_path;
+         uci_package *package = nullptr;
+-        if (uci_set_conf2dir(cursor, nullptr) || uci_load(cursor, "wireless", &package)) {
++        if (uci_set_conf2dir(cursor, nullptr) || uci_load(cursor, package_name, &package)) {
+             uci_free_context(cursor);
+             return false;
+         }
+@@ -543,6 +543,110 @@
+ }
+ 
+ } // namespace
++
++bool cfg_get_radio_inventory(std::vector<BPL_RADIO_IFACES> &radios)
++{
++    WirelessTransaction transaction;
++    Sections mesh, wireless;
++    std::set<std::string> endpoints, devices;
++    std::set<unsigned long> numbers;
++    radios.clear();
++    if (!transaction.read(mesh, "prplmesh") || !transaction.read(wireless)) return false;
++    for (const auto &section : mesh) {
++        if (text(section.second, ".type") != "wifi-device") continue;
++        const auto &name = section.first;
++        if (name.size() <= 5 || name.compare(0, 5, "radio") ||
++            name.find_first_not_of("0123456789", 5) != std::string::npos) return false;
++        const auto number = strtoul(name.c_str() + 5, nullptr, 10);
++        if (number >= BPL_NUM_OF_INTERFACES || !numbers.insert(number).second) return false;
++        for (const auto *field_name : {"hostap_iface", "sta_iface", "wireless_device"}) {
++            const auto option = section.second.find(field_name);
++            if (option != section.second.end() && option->second.list) return false;
++        }
++        BPL_RADIO_IFACES radio{};
++        radio.radio_num = number;
++        radio.hostap_iface = text(section.second, "hostap_iface");
++        radio.sta_iface = text(section.second, "sta_iface");
++        radio.wireless_device = text(section.second, "wireless_device");
++        if (radio.wireless_device.empty()) radio.wireless_device = name;
++        auto device = wireless.find(radio.wireless_device);
++        if ((radio.hostap_iface.empty() && radio.sta_iface.empty()) ||
++            device == wireless.end() || text(device->second, ".type") != "wifi-device" ||
++            (radio.hostap_iface.empty() && enabled(device->second, "disabled")) || !devices.insert(radio.wireless_device).second)
++            return false;
++        for (const auto &endpoint : {radio.hostap_iface, radio.sta_iface}) {
++            if (endpoint.empty()) continue;
++            if (endpoint.size() >= IFNAMSIZ || !endpoints.insert(endpoint).second) return false;
++            size_t matches = 0;
++            for (const auto &iface : wireless) {
++                const auto &values = iface.second;
++                if (text(values, ".type") != "wifi-iface" || text(values, "ifname") != endpoint) continue;
++                for (const auto *field_name : {"ifname", "device", "mode"}) {
++                    const auto option = values.find(field_name);
++                    if (option == values.end() || option->second.list) return false;
++                }
++                if (text(values, "device") != radio.wireless_device ||
++                    (radio.hostap_iface.empty() && enabled(values, "disabled")) ||
++                    text(values, "mode") != (endpoint == radio.hostap_iface ? "ap" : "sta")) return false;
++                ++matches;
++            }
++            if (matches != 1) return false;
++        }
++        radios.push_back(std::move(radio));
++    }
++    return !radios.empty() && radios.size() <= BPL_NUM_OF_INTERFACES;
++}
++
++bool bpl_cfg_sta_only_radio_quiet(const std::string &sta_iface, const std::string &ap_phy,
++                                   const std::string &wireless_device)
++{
++    WirelessTransaction transaction;
++    Sections sections;
++    if (ap_phy.empty() || !transaction.read(sections)) return false;
++    std::string device;
++    for (const auto &section : sections) {
++        const auto &values = section.second;
++        if (text(values, ".type") != "wifi-iface" || text(values, "ifname") != sta_iface) continue;
++        if (!device.empty() || text(values, "mode") != "sta" || enabled(values, "disabled")) return false;
++        device = text(values, "device");
++    }
++    if (device.empty() || device != wireless_device || !sections.count(device) ||
++        text(sections.at(device), ".type") != "wifi-device" || enabled(sections.at(device), "disabled")) return false;
++    for (const auto &section : sections) {
++        const auto &values = section.second;
++        if (text(values, ".type") == "wifi-iface" && text(values, "device") == device &&
++            text(values, "mode") == "ap") return false;
++    }
++    auto context = ubus_connect(nullptr);
++    if (!context) return false;
++    uint32_t id;
++    struct Result { const std::string &phy; bool observed = false; bool ap = false; bool valid = true; } result{ap_phy};
++    auto receive = [](ubus_request *request, int, blob_attr *message) {
++        auto &result = *static_cast<Result *>(request->priv);
++        auto interfaces = field(message, "interfaces");
++        if (!interfaces || blobmsg_type(interfaces) != BLOBMSG_TYPE_TABLE) return;
++        result.observed = true;
++        blob_attr *iface;
++        int remaining;
++        blobmsg_for_each_attr(iface, interfaces, remaining) {
++            blob_attr *phy = nullptr, *entry;
++            int nested_remaining;
++            blobmsg_for_each_attr(entry, iface, nested_remaining) {
++                if (std::string(blobmsg_name(entry)) == "wiphy") phy = entry;
++            }
++            if (!phy || blobmsg_type(phy) != BLOBMSG_TYPE_STRING) {
++                result.valid = false;
++                continue;
++            }
++            if (result.phy == blobmsg_get_string(phy)) result.ap = true;
++        }
++    };
++    bool quiet = !ubus_lookup_id(context, "hostapd", &id) &&
++        !ubus_invoke(context, id, "status", nullptr, receive, &result, 2000) &&
++        result.observed && result.valid && !result.ap;
++    ubus_free(context);
++    return quiet;
++}
+ 
+ bool bpl_cfg_apply_wifi_configuration(
+     const std::string &radio_iface,
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -19,6 +19,7 @@
+ #include <stdint.h>
+ #include <string>
+ #include <unordered_map>
++#include <vector>
+ 
+ namespace beerocks {
+ namespace nbapi {
+@@ -368,6 +369,19 @@
+     eFreqType freq_type;
+ };
+ 
++// Physical radio inventory. Either endpoint may be absent; a STA-only radio
++// must not be represented by an AP on a different physical device.
++struct BPL_RADIO_IFACES {
++    int radio_num;
++    std::string hostap_iface;
++    std::string sta_iface;
++    std::string wireless_device;
++};
++
++bool cfg_get_radio_inventory(std::vector<BPL_RADIO_IFACES> &radios);
++bool bpl_cfg_sta_only_radio_quiet(const std::string &sta_iface, const std::string &ap_phy,
++                                   const std::string &wireless_device);
++
+ /****************************************************************************/
+ /******************************** Functions *********************************/
+ /****************************************************************************/
