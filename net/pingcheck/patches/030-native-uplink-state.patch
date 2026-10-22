@@ -58,16 +58,27 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  int get_online_interface_names(const char** dest, int destLen)
-@@ -101,22 +114,34 @@
+@@ -101,22 +114,45 @@
  	return i;
  }
  
 -/* called from ubus interface event */
 +static void refresh_interfaces(struct uloop_timeout* timeout)
 +{
++	struct blob_attr* interfaces = NULL;
++	bool need_dump = false;
++	unsigned int generation = network_generation();
++
++	for (int i = 0; i < MAX_NUM_INTERFACES && intf[i].name[0]; i++)
++		need_dump |= !intf[i].conf_disabled && !intf[i].conf_ignore_ubus;
++	/* One owned response serves this pass only. A nested network event
++	 * invalidates it through the existing generation check and retry. */
++	if (need_dump)
++		interfaces = ubus_interface_dump();
 +	for (int i = 0; i < MAX_NUM_INTERFACES && intf[i].name[0]; i++)
 +		if (!intf[i].conf_disabled)
-+			ping_refresh(&intf[i]);
++			ping_refresh(&intf[i], interfaces, generation);
++	free(interfaces);
 +	if (!timeout->pending)
 +		uloop_timeout_set(timeout, 10000);
 +}
@@ -106,7 +117,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	}
  }
  
-@@ -172,6 +197,7 @@
+@@ -172,6 +208,7 @@
  	int ret;
  
  	log_open("pingcheck");
@@ -114,7 +125,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  	ret = uloop_init();
  	if (ret < 0) {
-@@ -186,8 +212,6 @@
+@@ -186,8 +223,6 @@
  		goto exit;
  	}
  
@@ -123,7 +134,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	ret = ubus_init();
  	if (!ret) {
  		goto exit;
-@@ -200,21 +224,15 @@
+@@ -200,21 +235,15 @@
  		goto exit;
  	}
  
@@ -153,7 +164,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  	/* main loop */
  	uloop_run();
-@@ -225,7 +243,7 @@
+@@ -225,7 +254,7 @@
  		if (!intf[i].conf_disabled) {
  			printf("%s:\t%-8s %3.0f%% (%d/%d on %s)\n", intf[i].name,
  				   get_status_str(intf[i].state),
@@ -172,11 +183,13 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	enum online_state state;
  	unsigned int cnt_sent;
  	unsigned int cnt_succ;
-@@ -94,13 +95,15 @@
+@@ -94,13 +95,18 @@
  
++struct blob_attr;
++
  // ping.c
  bool ping_init(struct ping_intf* pi);
-+void ping_refresh(struct ping_intf* pi);
++void ping_refresh(struct ping_intf* pi, struct blob_attr* interfaces, unsigned int generation);
  bool ping_send(struct ping_intf* pi);
  void ping_stop(struct ping_intf* pi);
  
@@ -184,12 +197,13 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  bool ubus_init(void);
  bool ubus_listen_network_events(void);
 -int ubus_interface_get_status(const char* name, char* device, size_t device_len);
-+int ubus_interface_get_status(struct ping_intf* pi, char* device, char* interface);
++struct blob_attr* ubus_interface_dump(void);
++int ubus_interface_get_status(struct blob_attr* reply, struct ping_intf* pi, char* device, char* interface);
 +void ubus_state_changed(void);
  bool ubus_register_server(void);
  void ubus_finish(void);
  
-@@ -114,6 +117,7 @@
+@@ -114,6 +120,7 @@
  void scripts_finish(void);
  
  // main.c
@@ -227,24 +241,23 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	LOG_INF("Init %s ping on '%s' (%s)", pi->conf_proto == TCP ? "TCP" : "ICMP",
  			pi->name, pi->device);
  
-@@ -178,6 +157,36 @@
+@@ -178,6 +157,35 @@
  	return true;
  }
  
-+void ping_refresh(struct ping_intf* pi)
++void ping_refresh(struct ping_intf* pi, struct blob_attr* interfaces, unsigned int generation)
 +{
 +	char device[MAX_IFNAME_LEN] = {0}, interface[MAX_IFNAME_LEN] = {0};
 +	int status;
-+	unsigned int generation = network_generation();
 +	if (pi->conf_ignore_ubus) {
 +		snprintf(device, sizeof(device), "%s", pi->conf_interfaces);
 +		snprintf(interface, sizeof(interface), "%s", pi->conf_interfaces);
 +		status = 2;
 +	} else {
-+		status = ubus_interface_get_status(pi, device, interface);
++		status = ubus_interface_get_status(interfaces, pi, device, interface);
++		if (generation != network_generation())
++			return;
 +	}
-+	if (generation != network_generation())
-+		return;
 +	if (status < 2 && (status != 1 || pi->conf_require_default)) {
 +		ping_stop(pi);
 +		state_change(status < 0 ? UNKNOWN : status == 0 ? DOWN :
@@ -275,7 +288,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		return false;
  	}
  
-@@ -67,150 +67,114 @@
+@@ -67,150 +67,125 @@
  	return true;
  }
  
@@ -334,17 +347,29 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +	return false;
 +}
 +
-+/* A successful dump establishes both presence and absence. Candidate names
-+ * are explicit ordered aliases; independent uplinks use independent probes. */
-+int ubus_interface_get_status(struct ping_intf* pi, char* device, char* interface)
++/* The caller owns this response until the current refresh pass ends. */
++struct blob_attr* ubus_interface_dump(void)
 +{
 +	struct blob_attr* reply = NULL;
 +	uint32_t id;
-+	int result = -1;
-+	bool pending = false;
++
 +	if (ubus_lookup_id(ctx, "network.interface", &id) ||
 +		ubus_invoke(ctx, id, "dump", NULL, ubus_result_cb, &reply, UBUS_TIMEOUT) ||
-+		!reply)
++		!reply) {
++		free(reply);
++		return NULL;
++	}
++	return reply;
++}
++
++/* A successful dump establishes both presence and absence. Candidate names
++ * are explicit ordered aliases; independent uplinks use independent probes. */
++int ubus_interface_get_status(struct blob_attr* reply, struct ping_intf* pi,
++							  char* device, char* interface)
++{
++	int result = -1;
++	bool pending = false;
++	if (!reply)
 +		goto out;
 +	const struct blobmsg_policy policy = { .name = "interface", .type = BLOBMSG_TYPE_ARRAY };
 +	struct blob_attr* entries;
@@ -383,7 +408,6 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +	if (pending)
 +		result = -1;
 +out:
-+	free(reply);
 +	return result;
 +}
 +
@@ -533,7 +557,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  /*** server ***/
-@@ -248,6 +212,9 @@
+@@ -248,6 +223,9 @@
  		blobmsg_add_string(&b, "status", get_status_str(pi->state));
  		blobmsg_add_string(&b, "interface", pi->name);
  		blobmsg_add_string(&b, "device", pi->device);
@@ -543,7 +567,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		blobmsg_add_u32(&b, "percent",
  						pi->cnt_sent > 0 ? pi->cnt_succ * 100 / pi->cnt_sent
  										 : 0);
-@@ -338,6 +305,12 @@
+@@ -338,6 +316,12 @@
  
  /*** init / finish ***/
  
@@ -556,7 +580,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  bool ubus_init(void)
  {
  	ctx = ubus_connect(NULL);
-@@ -345,12 +318,12 @@
+@@ -345,12 +329,12 @@
  		LOG_ERR("Failed to connect to ubus");
  		return false;
  	}
