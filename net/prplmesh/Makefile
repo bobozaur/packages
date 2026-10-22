@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=prplmesh
 PKG_VERSION:=6.2.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE:=prplMesh-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://gitlab.com/prpl-foundation/prplmesh/prplMesh/-/archive/$(PKG_VERSION)/
@@ -27,7 +27,8 @@ define Package/prplmesh
   CATEGORY:=Network
   TITLE:=prplMesh controller and agent for stock OpenWrt
   URL:=https://gitlab.com/prpl-foundation/prplmesh/prplMesh
-  DEPENDS:=+libstdcpp +libpthread +librt +libjson-c +libopenssl +libnl-core +libnl-genl +libnl-route +libuci +libubus +libubox +getopt
+  DEPENDS:=+libstdcpp +libpthread +librt +libjson-c +libopenssl +libnl-core +libnl-genl +libnl-route +libuci +libubus +libubox +getopt +rpcd +wifi-scripts
+  EXTRA_DEPENDS:=wifi-scripts (>=1.0-r12), rpcd (>=2026.10.04~d99f703e-r4), hostapd-common (>=2026.08.07~831364bf-r22)
 endef
 
 define Package/prplmesh/description

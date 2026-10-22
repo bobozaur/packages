@@ -1,0 +1,1641 @@
+Subject: [PATCH] platform: publish stock OpenWrt BSS settings through native UCI ownership
+
+Use bounded native publication for Controller roles, credentials, new APs,
+teardown and channel settings. Preserve pending writers and native netifd
+ownership. Observe live security and beacon state before completion; config_id
+alone is insufficient. Synchronize BSS descriptors and retire replaced HAL owners.
+
+Use standard wlan<N> names for real AP endpoints and preserve their physical
+radio ownership. This backend publishes supported AP roles; it does not add
+STA-only radio inventory or dedicated-backhaul topology support. Generated
+hostapd files and direct channel commands have no competing owner.
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -75,6 +75,9 @@
+ 
+ option(USE_PRPLMESH_WHM "Use prplMesh Wireless Hardware Manager" ON)
+ option(PRPLMESH_STOCK_OPENWRT_UCI "Build against stock OpenWrt UCI/ubus without Ambiorix or WHM" OFF)
++if (PRPLMESH_STOCK_OPENWRT_UCI)
++    add_definitions(-DPRPLMESH_STOCK_OPENWRT_UCI)
++endif()
+ 
+ option (ENABLE_BEEROCKS_CLI "Build beerocks CLI" ON)
+ option (ENABLE_PRPLMESH_CLI "Build prplMesh CLI" ON)
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -107,6 +107,11 @@
+             continue;
+         }
+         const auto &curr_vap = radio_vaps.at(vap_id);
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++        if (!curr_vap.active) {
++            continue;
++        }
++#endif
+ 
+         LOG(DEBUG) << "vap_id=" << int(vap_id) << ", iface_name=" << curr_vap.bss
+                    << ", mac=" << curr_vap.mac << ", ssid=" << curr_vap.ssid
+@@ -683,6 +688,13 @@
+         break;
+     }
+     case eApManagerState::OPERATIONAL: {
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++        if (ap_wlan_hal->get_state() == bwl::HALState::Failed) {
++            m_state = eApManagerState::TERMINATED;
++            continue_processing = true;
++            break;
++        }
++#endif
+         // Process external events
+         auto itFdMax =
+             std::max_element(std::begin(m_ap_hal_ext_events), std::end(m_ap_hal_ext_events));
+@@ -747,6 +759,13 @@
+             }
+         }
+ 
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++        if (ap_wlan_hal->get_state() == bwl::HALState::Failed) {
++            m_state = eApManagerState::TERMINATED;
++            continue_processing = true;
++            break;
++        }
++#endif
+         // Allow clients with expired blocking period timer
+         allow_expired_clients();
+         break;
+@@ -1276,7 +1295,7 @@
+ 
+         response->success() = true;
+ 
+-#ifndef USE_PRPLMESH_WHM
++#if !defined(USE_PRPLMESH_WHM) && !defined(PRPLMESH_STOCK_OPENWRT_UCI)
+         // Disable the radio interface to make hostapd to consider the new configuration.
+         if (!ap_wlan_hal->disable()) {
+             LOG(DEBUG) << "ap disable() failed!, the interface might be already disabled or down";
+@@ -1299,7 +1318,7 @@
+             break;
+         }
+ 
+-#ifndef USE_PRPLMESH_WHM
++#if !defined(USE_PRPLMESH_WHM) && !defined(PRPLMESH_STOCK_OPENWRT_UCI)
+         // Enable the radio interface to apply the new configuration.
+         if (!ap_wlan_hal->enable()) {
+             LOG(ERROR) << "Failed enable";
+@@ -2021,8 +2040,26 @@
+                 std::all_of(
+                     bss_info_conf_list.begin(), bss_info_conf_list.end(),
+                     [](const son::wireless_utils::sBssInfoConf &bss) { return bss.teardown; });
+-            const bool success = teardown_only && ap_wlan_hal->update_vap_credentials(
+-                                                      bss_info_conf_list, {}, {}, bridge_name);
++            bool success = teardown_only && ap_wlan_hal->update_vap_credentials(
++                                                bss_info_conf_list, {}, {}, bridge_name);
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++            if (success) {
++                const auto deadline = std::chrono::steady_clock::now() +
++                                      wait_for_vaps_enable_timeout_sec;
++                do {
++                    success = ap_wlan_hal->get_vap_status(bss_info_conf_list);
++                    if (ap_wlan_hal->get_state() == bwl::HALState::Failed ||
++                        !sync_ext_events_handlers()) {
++                        m_state = eApManagerState::TERMINATED;
++                        return;
++                    }
++                    if (success) {
++                        break;
++                    }
++                    UTILS_SLEEP_MSEC(500);
++                } while (std::chrono::steady_clock::now() < deadline);
++            }
++#endif
+             if (!success) {
+                 LOG(ERROR) << "Failed applying Agent-requested BSS teardown";
+             }
+@@ -2040,7 +2077,13 @@
+                 break;
+             }
+ 
+-            if (ap_wlan_hal->get_radio_info().radio_state == bwl::eRadioState::ENABLED) {
++            if (ap_wlan_hal->get_radio_info().radio_state == bwl::eRadioState::ENABLED
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++                // A Controller-torn-down BSS retains its native control socket.
++                // Its next M2 must be able to enable it through normal UCI.
++                || ap_wlan_hal->get_radio_info().radio_state == bwl::eRadioState::DISABLED
++#endif
++            ) {
+                 perform_update = true;
+                 LOG(DEBUG) << "Radio is in enabled state, performing vap credentials update";
+                 break;
+@@ -2050,8 +2093,14 @@
+ 
+         // Enabling VAPs and MLDs takes time to apply to the driver
+         if (perform_update && !bss_info_conf_list.empty()) {
+-            ap_wlan_hal->update_vap_credentials(bss_info_conf_list, backhaul_wps_ssid,
+-                                                backhaul_wps_passphrase, bridge_name);
++            if (!ap_wlan_hal->update_vap_credentials(bss_info_conf_list, backhaul_wps_ssid,
++                                                     backhaul_wps_passphrase, bridge_name)) {
++                LOG(ERROR) << "Failed applying Controller BSS configuration";
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++                m_state = eApManagerState::TERMINATED;
++#endif
++                return;
++            }
+ 
+             auto vap_timeout = std::chrono::steady_clock::now() + wait_for_vaps_enable_timeout_sec;
+             bool all_vaps_enabled = false, all_mld_updated = false;
+@@ -2061,6 +2110,13 @@
+                     LOG(INFO) << "All vaps are enabled";
+                     all_vaps_enabled = true;
+                 }
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++                if (ap_wlan_hal->get_state() == bwl::HALState::Failed ||
++                    !sync_ext_events_handlers()) {
++                    m_state = eApManagerState::TERMINATED;
++                    return;
++                }
++#endif
+ 
+                 if (!all_mld_updated && ap_wlan_hal->update_mld_status(bss_info_conf_list)) {
+                     LOG(INFO) << "MLD fields are updated";
+@@ -2074,6 +2130,9 @@
+             }
+             if (all_vaps_enabled == false || all_mld_updated == false) {
+                 LOG(ERROR) << "All the vaps are not yet enabled or mld updated";
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++                m_state = eApManagerState::TERMINATED;
++#endif
+                 return;
+             }
+ 
+@@ -2097,12 +2156,21 @@
+             // The 'available_vaps' container is cleared and filled inside update_vap_credentials()
+             auto response = message_com::create_vs_message<
+                 beerocks_message::cACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_RESPONSE>(cmdu_tx);
++            if (!response) {
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++                m_state = eApManagerState::TERMINATED;
++#endif
++                return;
++            }
+             const auto &radio_vaps              = ap_wlan_hal->get_radio_info().available_vaps;
+             response->number_of_bss_available() = radio_vaps.size();
+             send_cmdu(cmdu_tx);
+         } else {
+             LOG(ERROR) << "discard new configuration because "
+                        << (perform_update ? "configuration is empty" : "radio not enabled");
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++            m_state = eApManagerState::TERMINATED;
++#endif
+         }
+         break;
+     }
+@@ -4047,6 +4115,13 @@
+     }
+ 
+     const auto vap_info = vap_iter->second;
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    if (!vap_info.active) {
++        // hostapd can finish BSS setup while persistent disable suppresses
++        // beacons. That is not an active Controller fronthaul.
++        return true;
++    }
++#endif
+ 
+     LOG(INFO) << "vap_id = " << int(vap_id) << ", bssid = " << vap_info.mac
+               << ", ssid = " << vap_info.ssid << ", fronthaul = " << vap_info.fronthaul
+@@ -4216,6 +4291,26 @@
+ 
+     return true;
+ }
++
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++bool ApManager::sync_ext_events_handlers()
++{
++    // Polling can attach newly configured BSSs or retire old ones. Rebind
++    // every descriptor at this event-loop boundary, including numeric fd reuse.
++    for (auto fd : m_ap_hal_ext_events) {
++        if (fd > 0) {
++            m_event_loop->remove_handlers(fd);
++        }
++    }
++    m_ap_hal_ext_events = ap_wlan_hal->get_ext_events_fds();
++    for (auto fd : m_ap_hal_ext_events) {
++        if (fd > 0 && !register_ext_events_handlers(fd)) {
++            return false;
++        }
++    }
++    return true;
++}
++#endif
+ 
+ bool ApManager::register_ext_events_handlers(int fd)
+ {
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.h
+@@ -208,6 +208,9 @@
+     void remove_client_from_disallowed_list(const sMacAddr &mac, const sMacAddr &bssid);
+     void allow_expired_clients();
+     bool register_ext_events_handlers(int fd);
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    bool sync_ext_events_handlers();
++#endif
+ 
+     /**
+      * @brief Create a new BSS and register handlers for it.
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.cpp
+@@ -284,7 +284,7 @@
+     out << "bss{"
+         << "bssid=" << p.bssid << " ssid=" << p.ssid << " vap=" << m2.vap_type
+         << " label=" << m2.vap_label << " auth=" << eWscAuth_str(p.auth_type)
+-        << " encr=" << eWscEncr_str(p.encr_type) << " key=" << p.network_key
++        << " encr=" << eWscEncr_str(p.encr_type)
+         << " hidden=" << m2.hidden_ssid << " type="
+         << eWscVendorExtSubelementBssType_str(
+                static_cast<WSC::eWscVendorExtSubelementBssType>(p.bss_type))
+@@ -692,14 +692,22 @@
+ void ApAutoConfigurationTask::configuration_complete_wait_action(const std::string &radio_iface)
+ {
+     auto &radio_conf_params = m_radios_conf_params[radio_iface];
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    // Generic VAP-list events also update the available count. Only the AP
++    // manager response after matching native readback certifies this request.
++    if (!radio_conf_params.configuration_applied) return;
++#endif
+ #if !USE_PRPLMESH_WHM
+     // counting BSSes that are actually active is a faux-pas for whm; see PPM-2531 for discussion
+     // if after onboarding the agent is not operating correctly, debug by reading the datamodel
+ 
+-    // num_of_bss_available updates on ACTION_APMANAGER_WIFI_CREDENTIALS_UPDATE_RESPONSE handler
++#ifndef PRPLMESH_STOCK_OPENWRT_UCI
++    // Stock completion already requires matching native readback, which also
++    // permits a completely torn-down radio with zero active VAPs.
+     if (!radio_conf_params.num_of_bss_available) {
+         return;
+     }
++#endif
+ 
+     // Ap AutoConf starts to be applied once radio is up, i.e at least one BSS is enabled
+     // So no need to require for all BBSs to be enabled, (or even timeouting here)
+@@ -1524,6 +1532,18 @@
+             return;
+         }
+ 
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++        // The pending AP-manager response certifies the current native apply.
++        // Do not let a second M2 replace it before that readback completes.
++        const auto pending = m_radios_conf_params.find(radio->front.iface_name);
++        if (pending != m_radios_conf_params.end() &&
++            pending->second.state == eState::WAIT_AP_CONFIGURATION_COMPLETE) {
++            LOG(DEBUG) << "Ignoring overlapping M2 while native configuration is pending for "
++                       << radio->front.iface_name;
++            return;
++        }
++#endif
++
+         radio_iface_name       = radio->front.iface_name;
+         radio_iface_mac        = radio->front.iface_mac;
+         radio_freq_type        = radio->wifi_channel.get_freq_type();
+@@ -1708,6 +1728,7 @@
+     auto &radio_conf_params = m_radios_conf_params[radio_iface_name];
+ 
+     radio_conf_params.num_of_bss_available = 0;
++    radio_conf_params.configuration_applied = false;
+     radio_conf_params.enabled_bssids.clear();
+     radio_conf_params.sent_vaps_list_update     = false;
+     radio_conf_params.received_vaps_list_update = false;
+@@ -2594,7 +2615,6 @@
+     bSta_credentials->bss_type()        = info.payload_config.bss_type;
+ 
+     ss << "- SSID: " << info.payload_config.ssid << std::endl
+-       << "- Key: " << info.payload_config.network_key << std::endl
+        << "- Auth: " << std::hex << int(info.payload_config.auth_type) << std::endl
+        << "- Encr: " << std::hex << int(info.payload_config.encr_type) << std::endl;
+ 
+@@ -2917,6 +2937,7 @@
+     }
+ 
+     radio_conf_params.num_of_bss_available = response->number_of_bss_available();
++    radio_conf_params.configuration_applied = true;
+ 
+     auto db    = AgentDB::get();
+     auto radio = db->radio(radio_iface);
+@@ -3248,8 +3269,6 @@
+         LOG(DEBUG) << "authenticator: "
+                    << utils::dump_buffer(authenticator, WSC::WSC_AUTHENTICATOR_LENGTH);
+         LOG(DEBUG) << "calculated:    " << utils::dump_buffer(kwa, WSC::WSC_AUTHENTICATOR_LENGTH);
+-        LOG(DEBUG) << "authenticator key: " << utils::dump_buffer(authkey, 32);
+-        LOG(DEBUG) << "authenticator buf:" << std::endl << utils::dump_buffer(buf, sizeof(buf));
+         return false;
+     }
+ 
+@@ -3587,7 +3606,6 @@
+         }
+ 
+         ss << "- SSID: " << info.payload_config.ssid << std::endl
+-           << "- Key: " << info.payload_config.network_key << std::endl
+            << "- Auth: " << std::hex << int(info.payload_config.auth_type) << std::endl
+            << "- Encr: " << std::hex << int(info.payload_config.encr_type) << std::endl
+            << "- Hidden_SSID: " << info.m2_config.hidden_ssid << std::endl;
+--- a/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
++++ b/agent/src/beerocks/slave/tasks/ap_autoconfiguration_task.h
+@@ -73,6 +73,7 @@
+         uint8_t *m1_auth_buf         = nullptr;
+         size_t m1_auth_buf_len       = 0;
+         uint8_t num_of_bss_available = 0;
++        bool configuration_applied = false;
+         std::unordered_set<sMacAddr> enabled_bssids;
+         bool sent_vaps_list_update;
+         bool received_vaps_list_update;
+--- a/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
++++ b/agent/src/beerocks/slave/tasks/controller_connectivity_task.cpp
+@@ -175,8 +175,7 @@
+                             << "bssid: " << cred.bssid << std::endl
+                             << "bss_type: " << cred.bss_type << std::endl
+                             << "auth_type: " << WSC::eWscAuth_str(cred.auth_type) << std::endl
+-                            << "encr_type: " << WSC::eWscEncr_str(cred.encr_type) << std::endl
+-                            << "network_key: " << cred.network_key << std::endl;
++                            << "encr_type: " << WSC::eWscEncr_str(cred.encr_type) << std::endl;
+                     }
+                 }
+ 
+--- a/common/beerocks/bwl/CMakeLists.txt
++++ b/common/beerocks/bwl/CMakeLists.txt
+@@ -224,6 +224,9 @@
+ set_target_properties(${PROJECT_NAME} PROPERTIES LINK_FLAGS "-Wl,-z,defs")
+ set_target_properties(${PROJECT_NAME} PROPERTIES VERSION ${prplmesh_VERSION} SOVERSION ${prplmesh_VERSION_MAJOR})
+ target_link_libraries(${PROJECT_NAME} bcl elpp ${BWL_LIBS})
++if (PRPLMESH_STOCK_OPENWRT_UCI)
++    target_link_libraries(${PROJECT_NAME} bpl)
++endif()
+ target_include_directories(${PROJECT_NAME}
+     PRIVATE
+         ${PLATFORM_INCLUDE_DIR}
+--- a/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
++++ b/common/beerocks/bwl/include/bwl/base_wlan_hal_types.h
+@@ -70,6 +70,7 @@
+     std::string ap_mld_mac;
+     eVapType vap_type = eVapType::OTHER;
+     std::string vap_label;
++    bool active = true;
+ 
+     bool operator==(const VAPElement &other) const
+     {
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.cpp
+@@ -7,6 +7,9 @@
+  */
+ 
+ #include "ap_wlan_hal_nl80211.h"
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++#include <bpl/bpl_cfg.h>
++#endif
+ #include <bcl/beerocks_os_utils.h>
+ #include <bcl/beerocks_utils.h>
+ #include <bcl/network/network_utils.h>
+@@ -23,6 +26,7 @@
+ #include <netlink/msg.h>
+ #include <netlink/netlink.h>
+ #include <sstream>
++#include <set>
+ #include <type_traits>
+ 
+ //////////////////////////////////////////////////////////////////////////////
+@@ -54,7 +58,9 @@
+ 
+ static ap_wlan_hal::Event nl80211_to_bwl_event(const std::string &opcode)
+ {
+-    if (opcode == "AP-ENABLED") {
++    if (opcode == "CTRL-EVENT-TERMINATING") {
++        return ap_wlan_hal::Event::Interface_Disabled;
++    } else if (opcode == "AP-ENABLED") {
+         return ap_wlan_hal::Event::AP_Enabled;
+     } else if (opcode == "AP-DISABLED") {
+         return ap_wlan_hal::Event::AP_Disabled;
+@@ -572,6 +578,13 @@
+         return true;
+     }
+ 
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    if (m_radio_info.channel == chan &&
++        (bw == beerocks::eWiFiBandwidth::BANDWIDTH_UNKNOWN || m_radio_info.bandwidth == bw)) {
++        return true;
++    }
++    return beerocks::bpl::bpl_cfg_set_wifi_channel(m_radio_info.iface_name, chan, bw);
++#else
+     // Load hostapd config for the radio
+     prplmesh::hostapd::Configuration conf = load_hostapd_config(m_radio_info.iface_name);
+     if (!conf) {
+@@ -642,6 +655,7 @@
+     LOG(DEBUG) << "set_channel done";
+ 
+     return true;
++#endif
+ }
+ 
+ bool ap_wlan_hal_nl80211::sta_allow(const sMacAddr &mac, const sMacAddr &bssid)
+@@ -889,6 +903,15 @@
+     const std::string &backhaul_wps_ssid, const std::string &backhaul_wps_passphrase,
+     const std::string &bridge_ifname)
+ {
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    std::unordered_map<std::string, std::string> bss_ifnames;
++    for (const auto &vap : m_radio_info.available_vaps) {
++        bss_ifnames[vap.second.mac] = vap.second.bss;
++    }
++    return beerocks::bpl::bpl_cfg_apply_wifi_configuration(
++        m_radio_info.iface_name, bss_ifnames, bss_info_conf_list,
++        backhaul_wps_ssid, backhaul_wps_passphrase, m_expected_config_ids);
++#else
+     // Load hostapd config for the radio
+     prplmesh::hostapd::Configuration conf = load_hostapd_config(m_radio_info.iface_name);
+     if (!conf) {
+@@ -974,7 +997,7 @@
+         }
+ 
+         LOG(DEBUG) << "Autoconfiguration for ssid: " << bss_it.ssid << " auth_type: " << auth_type
+-                   << " encr_type: " << enc_type << " network_key: " << bss_it.network_key
++                   << " encr_type: " << enc_type
+                    << " fronthaul: " << beerocks::string_utils::bool_str(bss_it.fronthaul)
+                    << " backhaul: " << beerocks::string_utils::bool_str(bss_it.backhaul);
+ 
+@@ -1056,7 +1079,48 @@
+ 
+     LOG(DEBUG) << "Autoconfiguration: done:\n" << conf;
+     return true;
+-}
++#endif
++}
++
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++bool ap_wlan_hal_nl80211::get_vap_status(
++    const std::list<son::wireless_utils::sBssInfoConf> &bss_info_conf_list)
++{
++    if (m_expected_config_ids.empty()) {
++        return bss_info_conf_list.empty();
++    }
++    for (const auto &expected : m_expected_config_ids) {
++        if (add_interface(expected.first) < 0) {
++            return false;
++        }
++        parsed_obj_map_t config;
++        if (!wpa_ctrl_send_msg("GET_CONFIG", config, expected.first)) {
++            return false;
++        }
++        for (const auto &value : expected.second) {
++            auto actual = config[value.first];
++            auto wanted = value.second;
++            if (value.first == "key_mgmt" || value.first == "rsn_pairwise_cipher") {
++                auto words = [](const std::string &text) {
++                    std::istringstream input(text);
++                    std::set<std::string> result;
++                    std::string word;
++                    while (input >> word) result.insert(word);
++                    return result;
++                };
++                if (words(actual) == words(wanted)) continue;
++            } else if (actual == wanted) {
++                continue;
++            }
++            // Never include values: credential comparisons use this path too.
++            LOG(DEBUG) << "Native BSS configuration pending: " << expected.first
++                       << ", field " << value.first;
++            return false;
++        }
++    }
++    return refresh_vaps_info(beerocks::IFACE_RADIO_ID);
++}
++#endif
+ 
+ bool ap_wlan_hal_nl80211::sta_unassoc_rssi_measurement(const std::string &mac, int chan,
+                                                        beerocks::eWiFiBandwidth bw,
+@@ -1091,6 +1155,9 @@
+ bool ap_wlan_hal_nl80211::switch_channel(int chan, beerocks::eWiFiBandwidth bw,
+                                          int vht_center_frequency, int csa_beacon_count)
+ {
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    return beerocks::bpl::bpl_cfg_set_wifi_channel(m_radio_info.iface_name, chan, bw);
++#else
+     LOG(TRACE) << __func__ << " channel: " << chan << ", bw: " << bw
+                << ", vht_center_frequency: " << vht_center_frequency;
+ 
+@@ -1164,6 +1231,7 @@
+     }
+ 
+     return true;
++#endif
+ }
+ 
+ bool ap_wlan_hal_nl80211::cancel_cac(int chan, beerocks::eWiFiBandwidth bw,
+@@ -1672,6 +1740,9 @@
+     }
+ 
+     switch (event) {
++    case Event::Interface_Disabled:
++        event_queue_push(Event::Interface_Disabled);
++        return true;
+ 
+     case Event::AP_MGMT_FRAME_RECEIVED: {
+         if (parsed_obj.find("buf") == parsed_obj.end() || parsed_obj["buf"].empty()) {
+--- a/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/ap_wlan_hal_nl80211.h
+@@ -134,6 +134,11 @@
+     virtual bool
+     start_platform_acs(const std::shared_ptr<airties::cACSChannelList> &acs_list) override;
+ 
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    bool get_vap_status(
++        const std::list<son::wireless_utils::sBssInfoConf> &bss_info_conf_list) override;
++#endif
++
+     // Protected methods:
+ protected:
+     virtual bool process_nl80211_event(parsed_obj_map_t &parsed_obj) override;
+@@ -145,6 +150,9 @@
+     }
+ 
+ private:
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> m_expected_config_ids;
++#endif
+     // Connected-clients import and reconciliation (STA-FIRST/STA-NEXT sweep)
+     static constexpr int INVALID_VAP_ID = -1;
+     std::set<int> m_completed_vaps;
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.cpp
+@@ -577,13 +577,16 @@
+     auto buffer = m_wpa_ctrl_buffer.get();
+ 
+     if (!wpa_ctrl_cmd->request(cmd, buffer, m_wpa_ctrl_buffer_size)) {
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++        m_hal_state = HALState::Failed;
++#endif
+         LOG(ERROR) << "can't send wpa_ctrl_request";
+-        LOG(ERROR) << "failed cmd: " << cmd;
++        LOG(ERROR) << "failed cmd: " << wpa_ctrl_log_command(cmd);
+         return false;
+     }
+ 
+     if ((!strncmp(buffer, "FAIL", 4)) || (!strncmp(buffer, "UNKNOWN", 7))) {
+-        LOG(DEBUG) << std::endl << "cmd failed: " << cmd;
++        LOG(DEBUG) << std::endl << "cmd failed: " << wpa_ctrl_log_command(cmd);
+         LOG(WARNING) << std::endl << "reply: " << buffer;
+         return false;
+     }
+@@ -861,6 +864,7 @@
+             return false;
+         }
+ 
++        vap_element.active = network_configuration.active;
+         switch (network_configuration.multi_ap) {
+         case beerocks::eBssType::BSS_TYPE_BACKHAUL:
+             vap_element.fronthaul = false;
+@@ -882,6 +886,11 @@
+             break;
+         }
+ 
++        vap_element.profile1_backhaul_sta_association_disallowed =
++            network_configuration.multi_ap_client_disallow & 1;
++        vap_element.profile2_backhaul_sta_association_disallowed =
++            network_configuration.multi_ap_client_disallow & 2;
++
+         auto &mapped_vap_element = m_radio_info.available_vaps[vap_id];
+         if (mapped_vap_element.bss.empty()) {
+             LOG(WARNING) << "BSS " << vap_element.bss << " is not preconfigured!"
+@@ -905,6 +914,13 @@
+         // therefore there is no need to update the information except the BSS mac that is not
+         // preset.
+         mapped_vap_element.mac = vap_element.mac;
++        mapped_vap_element.active = vap_element.active;
++        mapped_vap_element.fronthaul = vap_element.fronthaul;
++        mapped_vap_element.backhaul = vap_element.backhaul;
++        mapped_vap_element.profile1_backhaul_sta_association_disallowed =
++            vap_element.profile1_backhaul_sta_association_disallowed;
++        mapped_vap_element.profile2_backhaul_sta_association_disallowed =
++            vap_element.profile2_backhaul_sta_association_disallowed;
+ 
+         return true;
+     };
+@@ -1202,20 +1218,19 @@
+         return false;
+     }
+ 
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++    network_configuration.active = reply["start_disabled"] == "0" &&
++                                   reply["start_deferred"] == "0" &&
++                                   reply["beacon_set"] == "1";
++#endif
+     network_configuration.bssid                  = reply["bssid"];
+     network_configuration.ssid                   = reply["ssid"];
+     network_configuration.wps_state              = reply["wps_state"];
+     network_configuration.multi_ap               = beerocks::string_utils::stoi(reply["multi_ap"]);
++    network_configuration.multi_ap_client_disallow =
++        beerocks::string_utils::stoi(reply["multi_ap_client_disallow"]);
+     network_configuration.multi_ap_backhaul_ssid = reply["multi_ap_backhaul_ssid"];
+ 
+-    std::string reply_str;
+-    for (const auto &entry : reply) {
+-        if (!reply_str.empty()) {
+-            reply_str += "\n";
+-        }
+-        reply_str += entry.first + "=" + entry.second;
+-    }
+-    LOG(TRACE) << "GET_CONFIG reply for " << iface_name << " = \n" << reply_str;
+ 
+     return true;
+ }
+--- a/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
++++ b/common/beerocks/bwl/nl80211/base_wlan_hal_nl80211.h
+@@ -153,7 +153,9 @@
+         std::string bssid;
+         std::string ssid;
+         std::string wps_state;
++        bool active = true;
+         int multi_ap;
++        int multi_ap_client_disallow = 0;
+         std::string multi_ap_backhaul_ssid;
+     };
+ 
+--- a/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
++++ b/common/beerocks/bwl/nl80211/sta_wlan_hal_nl80211.cpp
+@@ -196,7 +196,7 @@
+ 
+     const std::string cmd = "REMOVE_NETWORK " + std::to_string(m_active_network_id);
+     if (!wpa_ctrl_send_msg(cmd)) {
+-        LOG(ERROR) << "WPA command '" << cmd << "' failed";
++        LOG(ERROR) << "WPA command '" << wpa_ctrl_log_command(cmd) << "' failed";
+     }
+ 
+     // Clear state
+@@ -231,7 +231,7 @@
+ 
+     const std::string cmd = "ROAM " + bssid_str;
+     if (!wpa_ctrl_send_msg(cmd)) {
+-        LOG(ERROR) << "WPA command '" << cmd << "' failed";
++        LOG(ERROR) << "WPA command '" << wpa_ctrl_log_command(cmd) << "' failed";
+         ;
+         return false;
+     }
+@@ -393,7 +393,7 @@
+ 
+     std::string cmd = "ADD_NETWORK";
+     if (!wpa_ctrl_send_msg(cmd, &reply)) {
+-        LOG(ERROR) << "WPA command '" << cmd << "' failed";
++        LOG(ERROR) << "WPA command '" << wpa_ctrl_log_command(cmd) << "' failed";
+         ;
+         return -1;
+     }
+@@ -407,7 +407,7 @@
+ {
+     const std::string cmd = "SET_NETWORK " + std::to_string(network_id) + " " + param + " " + value;
+     if (!wpa_ctrl_send_msg(cmd)) {
+-        LOG(ERROR) << "WPA command '" << cmd << "' failed";
++        LOG(ERROR) << "WPA command '" << wpa_ctrl_log_command(cmd) << "' failed";
+         ;
+         return false;
+     }
+@@ -472,7 +472,7 @@
+ {
+     const std::string cmd = "ENABLE_NETWORK " + std::to_string(network_id);
+     if (!wpa_ctrl_send_msg(cmd)) {
+-        LOG(ERROR) << "WPA command '" << cmd << "' failed";
++        LOG(ERROR) << "WPA command '" << wpa_ctrl_log_command(cmd) << "' failed";
+         ;
+         return false;
+     }
+@@ -490,7 +490,7 @@
+     const char *cmd = "STATUS";
+     parsed_obj_map_t reply;
+     if (!wpa_ctrl_send_msg(cmd, reply)) {
+-        LOG(ERROR) << "WPA command '" << cmd << "' failed";
++        LOG(ERROR) << "WPA command '" << wpa_ctrl_log_command(cmd) << "' failed";
+         ;
+         return false;
+     }
+--- a/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp
++++ b/common/beerocks/bwl/nl80211/wpa_ctrl_client.cpp
+@@ -9,6 +9,7 @@
+ #include "wpa_ctrl_client.h"
+ 
+ #include <easylogging++.h>
++#include <sys/stat.h>
+ 
+ extern "C" {
+ #include <wpa_ctrl.h>
+@@ -32,6 +33,13 @@
+         LOG(ERROR) << "wpa_ctrl_open() failed, ctrl_iface_path: " << m_path;
+         return false;
+     }
++    struct stat peer;
++    if (stat(m_path.c_str(), &peer) != 0) {
++        close();
++        return false;
++    }
++    m_peer_device = peer.st_dev;
++    m_peer_inode = peer.st_ino;
+     LOG(DEBUG) << "WPA ctrl sock is opened with path " << m_path;
+     return true;
+ }
+@@ -71,6 +79,13 @@
+         return false;
+     }
+ 
++    struct stat peer;
++    if (stat(path().c_str(), &peer) != 0 ||
++        uint64_t(peer.st_dev) != m_peer_device || uint64_t(peer.st_ino) != m_peer_inode) {
++        // Do not reopen one half of a cmd/event pair behind its event-loop
++        // owner. The HAL owner retires both and imports the native replacement.
++        return false;
++    }
+     int result;
+     int try_cnt         = 0;
+     auto buff_size_copy = buff_size;
+@@ -79,7 +94,7 @@
+     } while (result == -2 && ++try_cnt < WPA_CTRL_READ_RETRY_MAX);
+ 
+     if (result < 0) {
+-        LOG(ERROR) << "can't send wpa_ctrl_request with cmd: " << cmd;
++        LOG(ERROR) << "can't send wpa_ctrl_request with cmd: " << wpa_ctrl_log_command(cmd);
+         return false;
+     }
+ 
+--- a/common/beerocks/bwl/nl80211/wpa_ctrl_client.h
++++ b/common/beerocks/bwl/nl80211/wpa_ctrl_client.h
+@@ -10,6 +10,7 @@
+ #define _BWL_WPA_CTRL_CLIENT_H_
+ 
+ #include <algorithm>
++#include <cstdint>
+ #include <functional>
+ #include <map>
+ #include <memory>
+@@ -22,6 +23,24 @@
+ namespace bwl {
+ namespace nl80211 {
+ 
++// Retain operation/id/parameter context without exposing credential values.
++inline std::string wpa_ctrl_log_command(const std::string &cmd)
++{
++    if (cmd.rfind("SET_NETWORK ", 0) == 0) {
++        auto id_end = cmd.find(' ', 12);
++        auto param_end = id_end == std::string::npos ? id_end : cmd.find(' ', id_end + 1);
++        return cmd.substr(0, param_end) + " <redacted>";
++    }
++    if (cmd.rfind("SET ", 0) == 0) {
++        return cmd.substr(0, cmd.find(' ', 4)) + " <redacted>";
++    }
++    if (cmd.rfind("WPS_PIN", 0) == 0 || cmd.rfind("WPS_AP_PIN", 0) == 0) {
++        return cmd.substr(0, cmd.find(' ')) + " <redacted>";
++    }
++    return cmd;
++}
++
++
+ /**
+  * @brief WPA Ctrl socket Class.
+  *
+@@ -107,6 +126,9 @@
+      * It is allocate when opening the socket, and freed when closing it.
+      */
+     struct wpa_ctrl *m_ctx = nullptr;
++    // A recreated native daemon is a new owner, even at the same pathname.
++    uint64_t m_peer_device = 0;
++    uint64_t m_peer_inode = 0;
+ 
+     /**
+      * Const value: maximum retries of time-outed buffer reading
+--- /dev/null
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg_wifi_apply.cpp
+@@ -0,0 +1,799 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "bpl_cfg_helper.h"
++
++#include <bpl/bpl_cfg.h>
++#include <bcl/beerocks_utils.h>
++#include <bcl/network/network_utils.h>
++#include <easylogging++.h>
++#include <mapf/common/encryption.h>
++
++extern "C" {
++#include <libubox/blobmsg.h>
++#include <libubus.h>
++#include <uci.h>
++}
++
++#include <openssl/evp.h>
++#include <openssl/crypto.h>
++#include <cctype>
++#include <cstdlib>
++#include <algorithm>
++#include <map>
++#include <set>
++#include <sstream>
++#include <vector>
++
++namespace beerocks {
++namespace bpl {
++namespace {
++
++struct Value {
++    bool list = false;
++    std::vector<std::string> strings;
++
++    Value() = default;
++    Value(const std::string &text) : strings{text} {}
++    bool operator==(const Value &other) const
++    {
++        return list == other.list && strings == other.strings;
++    }
++};
++using Options = std::map<std::string, Value>;
++using Sections = std::map<std::string, Options>;
++
++blob_attr *field(blob_attr *message, const char *name)
++{
++    blob_attr *attr;
++    int remaining;
++    blob_for_each_attr(attr, message, remaining) {
++        if (std::string(blobmsg_name(attr)) == name) {
++            return attr;
++        }
++    }
++    return nullptr;
++}
++
++std::string text(const Options &options, const std::string &name)
++{
++    auto it = options.find(name);
++    return it == options.end() || it->second.strings.size() != 1 ? "" : it->second.strings[0];
++}
++
++bool enabled(const Options &options, const std::string &name)
++{
++    auto it = options.find(name);
++    return it != options.end() && !it->second.list &&
++           (text(options, name) == "1" || text(options, name) == "true");
++}
++
++bool primary_ap(const Sections &sections, const std::string &ifname, std::string &name)
++{
++    name.clear();
++    for (const auto &section : sections) {
++        if (text(section.second, ".type") != "wifi-iface" ||
++            text(section.second, "mode") != "ap" ||
++            text(section.second, "ifname") != ifname) continue;
++        if (!name.empty()) return false;
++        name = section.first;
++    }
++    return !name.empty();
++}
++
++// The native rpcd publication owns conflict admission, snapshots and commit.
++// Local reads use the same committed-only UCI view; no CLI/session delta is
++// imported, staged, consumed or removed by this producer.
++class WirelessTransaction {
++public:
++    ~WirelessTransaction()
++    {
++        blob_buf_free(&request);
++        if (context) {
++            ubus_free(context);
++        }
++    }
++
++    bool open() { return (context = ubus_connect(nullptr)) != nullptr; }
++    void bind(const std::string &section) { anchor = section; }
++
++    bool read(Sections &sections)
++    {
++        auto cursor = uci_alloc_context();
++        if (!cursor) {
++            return false;
++        }
++        uci_element *element, *next;
++        uci_foreach_element_safe(&cursor->delta_path, next, element) {
++            uci_list_del(&element->list);
++            free(element->name);
++            free(element);
++        }
++        uci_package *package = nullptr;
++        if (uci_set_conf2dir(cursor, nullptr) || uci_load(cursor, "wireless", &package)) {
++            uci_free_context(cursor);
++            return false;
++        }
++        sections.clear();
++        uci_foreach_element(&package->sections, element) {
++            auto section = uci_to_section(element);
++            auto &values = sections[element->name];
++            values[".type"] = Value(section->type);
++            uci_element *option;
++            uci_foreach_element(&section->options, option) {
++                auto input = uci_to_option(option);
++                auto &value = values[option->name];
++                if (input->type == UCI_TYPE_STRING) {
++                    value.strings.emplace_back(input->v.string);
++                } else {
++                    value.list = true;
++                    uci_element *item;
++                    uci_foreach_element(&input->v.list, item) {
++                        value.strings.emplace_back(item->name);
++                    }
++                }
++            }
++        }
++        uci_free_context(cursor);
++        snapshot = sections;
++        return true;
++    }
++
++    bool publish(Sections desired,
++                 std::map<std::string, std::vector<std::string>> removed = {})
++    {
++        // Read-only primary AP assertion binds radio/ifname/network identity
++        // to the same locked publication, including a new-BSS-only request.
++        if (anchor.empty() || !snapshot.count(anchor)) return false;
++        desired.emplace(anchor, Options{});
++        std::string device;
++        std::set<std::string> credential_owners;
++        for (const auto &section : desired) {
++            const auto type = snapshot.count(section.first)
++                                  ? text(snapshot.at(section.first), ".type") : "wifi-iface";
++            if (type == "wifi-device") {
++                device = section.first;
++            } else if (type == "wifi-iface") {
++                const auto &old = snapshot.count(section.first) ? snapshot.at(section.first)
++                                                                : section.second;
++                device = text(old, "device");
++                if (text(section.second, "start_disabled") == "0") {
++                    credential_owners.insert(section.first);
++                }
++            }
++        }
++        if (device.empty() || !snapshot.count(device)) {
++            return false;
++        }
++
++        // Per-station passwords are additional credential sources. Retire only
++        // bindings to APs whose credentials this publication replaces; retain
++        // the station's key and every other interface binding.
++        for (const auto &section : snapshot) {
++            if (text(section.second, ".type") != "wifi-station" ||
++                (text(section.second, "disabled") == "1" ||
++                 text(section.second, "disabled") == "true") ||
++                text(section.second, "key").empty()) {
++                continue;
++            }
++            Value bindings;
++            bindings.list = true;
++            const bool has_binding = section.second.count("iface") != 0;
++            if (has_binding) {
++                bindings = section.second.at("iface");
++                if (!bindings.list) {
++                    std::istringstream names(bindings.strings[0]);
++                    bindings.strings.clear();
++                    std::string name;
++                    while (names >> name) bindings.strings.push_back(name);
++                    bindings.list = true;
++                    if (bindings.strings.empty()) continue; // scalar-empty is inactive
++                }
++            }
++            // An absent/empty binding also covers APs created by this batch.
++            const bool global = !has_binding || bindings.strings.empty();
++            if (global) {
++                for (const auto &candidate : snapshot) {
++                    if (text(candidate.second, ".type") == "wifi-iface" &&
++                        text(candidate.second, "mode") == "ap") {
++                        bindings.strings.push_back(candidate.first);
++                    }
++                }
++            }
++            const auto size = bindings.strings.size();
++            bindings.strings.erase(std::remove_if(bindings.strings.begin(), bindings.strings.end(),
++                [&](const std::string &name) { return credential_owners.count(name) != 0; }),
++                bindings.strings.end());
++            if (bindings.strings.size() == size && (!global || credential_owners.empty())) continue;
++            if (bindings.strings.empty()) {
++                // Removing the last binding would make it global again.
++                desired[section.first]["disabled"] = Value("1");
++            } else {
++                desired[section.first]["iface"] = std::move(bindings);
++            }
++        }
++
++        blob_buf_init(&request, 0);
++        blobmsg_add_string(&request, "device", device.c_str());
++        add_table("expected_device", snapshot.at(device));
++        auto updates = blobmsg_open_array(&request, "updates");
++        for (const auto &section : desired) {
++            auto update = blobmsg_open_table(&request, nullptr);
++            blobmsg_add_string(&request, "section", section.first.c_str());
++            if (snapshot.count(section.first)) {
++                add_table("expected", snapshot.at(section.first));
++            } else {
++                blobmsg_add_field(&request, BLOBMSG_TYPE_UNSPEC, "expected", nullptr, 0);
++            }
++            auto values = blobmsg_open_table(&request, "values");
++            add_options(section.second, true);
++            for (const auto &name : removed[section.first]) {
++                if (!section.second.count(name)) {
++                    blobmsg_add_field(&request, BLOBMSG_TYPE_UNSPEC, name.c_str(), nullptr, 0);
++                }
++            }
++            blobmsg_close_table(&request, values);
++            blobmsg_close_table(&request, update);
++        }
++        blobmsg_close_array(&request, updates);
++
++        uint32_t id;
++        if (ubus_lookup_id(context, "uci", &id)) {
++            return false;
++        }
++        bool saved = false;
++        auto receive = [](ubus_request *req, int, blob_attr *message) {
++            auto status = field(message, "status");
++            if (status && blobmsg_type(status) == BLOBMSG_TYPE_STRING) {
++                *static_cast<bool *>(req->priv) =
++                    std::string(blobmsg_get_string(status)) == "saved";
++            }
++        };
++        return ubus_invoke(context, id, "wireless_apply", request.head, receive, &saved, 5000) == 0 &&
++               saved;
++    }
++
++private:
++    void add_options(const Options &options, bool empty_is_absent = false)
++    {
++        for (const auto &option : options) {
++            if (option.second.list) {
++                auto array = blobmsg_open_array(&request, option.first.c_str());
++                for (const auto &value : option.second.strings) {
++                    blobmsg_add_string(&request, nullptr, value.c_str());
++                }
++                blobmsg_close_array(&request, array);
++            } else if (empty_is_absent && option.second.strings[0].empty()) {
++                // libuci set of an empty scalar removes that option.
++                blobmsg_add_field(&request, BLOBMSG_TYPE_UNSPEC, option.first.c_str(), nullptr, 0);
++            } else {
++                blobmsg_add_string(&request, option.first.c_str(), option.second.strings[0].c_str());
++            }
++        }
++    }
++    void add_table(const char *name, const Options &options)
++    {
++        auto table = blobmsg_open_table(&request, name);
++        add_options(options);
++        blobmsg_close_table(&request, table);
++    }
++
++    ubus_context *context = nullptr;
++    blob_buf request = {};
++    Sections snapshot;
++    std::string anchor;
++};
++
++bool owned_directive(const std::string &name)
++{
++    static const std::set<std::string> names = {
++        "interface", "bss", "bssid", "ctrl_interface", "bridge", "ssid", "ssid2",
++        "auth_algs", "wpa", "wpa_key_mgmt", "wpa_pairwise", "rsn_pairwise", "wpa_group",
++        "wpa_passphrase", "wpa_psk", "wpa_psk_file", "wpa_psk_file_static", "wpa_psk_radius",
++        "sae_password", "sae_password_file", "ieee80211w", "ieee8021x", "eap_server",
++        "auth_server_addr", "auth_server_port", "auth_server_shared_secret",
++        "start_disabled", "start_deferred", "ignore_broadcast_ssid", "wps_state",
++        "wps_independent", "notify_mgmt_frames", "config_id"
++    };
++    return names.count(name) || name.rfind("multi_ap", 0) == 0 ||
++           name.rfind("rsn_override", 0) == 0;
++}
++
++Value unrelated_options(const Options &current)
++{
++    Value result;
++    result.list = true;
++    auto raw = current.find("hostapd_bss_options");
++    if (raw == current.end()) {
++        return result;
++    }
++    for (const auto &value : raw->second.strings) {
++        std::istringstream lines(value);
++        std::string line;
++        while (std::getline(lines, line)) {
++            const auto begin = line.find_first_not_of(" \t\r");
++            const auto equal = line.find('=', begin);
++            if (begin != std::string::npos && equal != std::string::npos) {
++                const auto end = line.find_last_not_of(" \t", equal - 1);
++                if (end != std::string::npos && owned_directive(line.substr(begin, end - begin + 1))) {
++                    continue;
++                }
++            }
++            result.strings.push_back(line);
++        }
++    }
++    return result;
++}
++
++std::string hex_string(const unsigned char *bytes, size_t length)
++{
++    constexpr char hex[] = "0123456789abcdef";
++    std::string result;
++    for (size_t i = 0; i < length; ++i) {
++        result += hex[bytes[i] >> 4];
++        result += hex[bytes[i] & 15];
++    }
++    return result;
++}
++
++std::string raw_value(const Options &options, const std::string &name)
++{
++    std::string result;
++    auto raw = options.find("hostapd_bss_options");
++    if (raw == options.end()) return result;
++    for (const auto &entry : raw->second.strings) {
++        std::istringstream lines(entry);
++        std::string line;
++        while (std::getline(lines, line)) {
++            auto begin = line.find_first_not_of(" \t\r");
++            auto equal = line.find('=', begin);
++            if (begin == std::string::npos || equal == std::string::npos) continue;
++            auto end = line.find_last_not_of(" \t", equal - 1);
++            if (end != std::string::npos && line.substr(begin, end - begin + 1) == name)
++                result = line.substr(equal + 1);
++        }
++    }
++    return result;
++}
++
++const std::vector<std::string> credential_overrides = {
++    "sae_password", "sae_password_file", "wpa_psk_file", "ppsk", "dpp",
++    "auth_server", "auth_server_addr", "auth_server_shared_secret", "wpa_psk",
++    "wpa_passphrase", "wpa_psk_radius", "wpa_psk_file_static", "wpa_key_mgmt",
++    "rsn_override_key_mgmt", "rsn_override_pairwise", "rsn_override_mfp",
++    "rsn_override_key_mgmt_2", "rsn_override_pairwise_2", "rsn_override_mfp_2"
++};
++
++bool native_security_policy(const Options &old, const Options &device, Options &values)
++{
++    if (text(values, "start_disabled") == "1") return true;
++    // This stock backend implements the basic non-MLD radio contract. Do not
++    // publish a security mode that the native 6 GHz/EHT generator transforms.
++    if (text(device, "band") == "6g" || text(device, "htmode").rfind("EHT", 0) == 0) {
++        LOG(ERROR) << "Controller security requires an unsupported 6 GHz/EHT radio policy";
++        return false;
++    }
++    const bool secured = text(values, "encryption") != "none";
++    const bool raw_ocv = std::strtol(raw_value(old, "ocv").c_str(), nullptr, 10) != 0;
++    const bool mbo = enabled(old, "mbo") ||
++        std::strtol(raw_value(old, "mbo").c_str(), nullptr, 10) != 0;
++    if (!secured && (raw_ocv || enabled(old, "hs20") ||
++        std::strtol(raw_value(old, "hs20").c_str(), nullptr, 10) != 0)) {
++        LOG(ERROR) << "Controller open security conflicts with retained native policy";
++        return false;
++    }
++    // Native MBO/OCV requires optional PMF with WPA2. Keep these features
++    // and deliberately publish/read back the same legal native policy.
++    if (secured && text(values, "ieee80211w") == "0" &&
++        (mbo || enabled(old, "ocv") || raw_ocv))
++        values["ieee80211w"] = Value("1");
++    return true;
++}
++
++bool expected_security(const Options &desired,
++                       std::unordered_map<std::string, std::string> &expected)
++{
++    const auto encryption = text(desired, "encryption");
++    const auto ssid = text(desired, "ssid");
++    expected["ssid_hex"] = hex_string(
++        reinterpret_cast<const unsigned char *>(ssid.data()), ssid.size());
++    expected["ieee80211w"] = text(desired, "ieee80211w");
++    expected["multi_ap"] = text(desired, "multi_ap") == "0" ? "" : text(desired, "multi_ap");
++    expected["sae_password_count"] = "0";
++    if (encryption == "none") {
++        expected["wpa"] = "";
++        expected["key_mgmt"] = "";
++        expected["wpa_psk_count"] = "0";
++        return true;
++    }
++    expected["wpa"] = "2";
++    const bool sae = encryption.find("sae") != std::string::npos;
++    const bool psk = encryption.find("psk") != std::string::npos ||
++                     encryption.find("mixed") != std::string::npos;
++    const bool pmf = text(desired, "ieee80211w") != "0";
++    const bool ft = enabled(desired, "ieee80211r");
++    const bool sae_ext = enabled(desired, "sae_ext_key");
++    std::string akm;
++    auto append = [&](const std::string &name) {
++        if (!akm.empty()) akm += " ";
++        akm += name;
++    };
++    if (sae) {
++        append("SAE");
++        if (sae_ext) append("SAE-EXT-KEY");
++        if (ft) {
++            append("FT-SAE");
++            if (sae_ext) append("FT-SAE-EXT-KEY");
++        }
++    }
++    if (psk) {
++        append("WPA-PSK");
++        if (ft) append("FT-PSK");
++        if (pmf) append("WPA-PSK-SHA256");
++    }
++    expected["key_mgmt"] = akm;
++    const bool tkip = encryption.find("tkip") != std::string::npos;
++    expected["rsn_pairwise_cipher"] = tkip ? "TKIP CCMP" : "CCMP";
++    expected["group_cipher"] = tkip ? "TKIP" : "CCMP";
++    expected["wpa_psk_count"] = "1";
++    auto key = text(desired, "key");
++    if (key.size() == 64) {
++        std::transform(key.begin(), key.end(), key.begin(),
++                       [](unsigned char c) { return std::tolower(c); });
++        expected["psk"] = key;
++    } else {
++        unsigned char psk_bytes[32];
++        if (!PKCS5_PBKDF2_HMAC_SHA1(key.data(), key.size(),
++                reinterpret_cast<const unsigned char *>(ssid.data()), ssid.size(),
++                4096, sizeof(psk_bytes), psk_bytes)) {
++            return false;
++        }
++        expected["psk"] = hex_string(psk_bytes, sizeof(psk_bytes));
++        expected["passphrase"] = key;
++        OPENSSL_cleanse(psk_bytes, sizeof(psk_bytes));
++    }
++    return true;
++}
++
++bool credentials(const son::wireless_utils::sBssInfoConf &bss, Options &values)
++{
++    if (std::any_of(bss.network_key.begin(), bss.network_key.end(),
++                    [](unsigned char value) { return value < 0x20 || value == 0x7f; })) {
++        return false;
++    }
++    if (bss.teardown) {
++        // Keep the real radio's control interface available for the next M2.
++        values["start_disabled"] = Value("1");
++        return true;
++    }
++    const auto auth = static_cast<uint16_t>(bss.authentication_type);
++    const auto wpa2 = static_cast<uint16_t>(WSC::eWscAuth::WSC_AUTH_WPA2PSK);
++    const auto sae = static_cast<uint16_t>(WSC::eWscAuth::WSC_AUTH_SAE);
++    std::string encryption, pmf = "0";
++    if (bss.authentication_type == WSC::eWscAuth::WSC_AUTH_OPEN &&
++        bss.encryption_type == WSC::eWscEncr::WSC_ENCR_NONE) {
++        encryption = "none";
++    } else {
++        if ((auth != wpa2 && auth != sae && auth != (wpa2 | sae)) ||
++            !(static_cast<uint16_t>(bss.encryption_type) &
++              static_cast<uint16_t>(WSC::eWscEncr::WSC_ENCR_AES)) ||
++            bss.network_key.size() < 8 || bss.network_key.size() > 64) {
++            return false;
++        }
++        if (bss.network_key.size() == 64 &&
++            (auth != wpa2 || bss.network_key.find_first_not_of("0123456789abcdefABCDEF") !=
++                                std::string::npos)) {
++            return false;
++        }
++        if (auth == sae || auth == (wpa2 | sae)) {
++            if (bss.encryption_type != WSC::eWscEncr::WSC_ENCR_AES) {
++                return false;
++            }
++            encryption = auth == sae ? "sae" : "sae-mixed";
++            pmf = auth == sae ? "2" : "1";
++        } else {
++            encryption = "psk2";
++        }
++        encryption += (static_cast<uint16_t>(bss.encryption_type) &
++                       static_cast<uint16_t>(WSC::eWscEncr::WSC_ENCR_TKIP))
++                          ? "+tkip+ccmp"
++                          : "+ccmp";
++        values["key"] = Value(bss.network_key);
++    }
++    if (bss.ssid.empty() || bss.ssid.size() > 32) {
++        return false;
++    }
++    values["ssid"] = Value(bss.ssid);
++    values["encryption"] = Value(encryption);
++    values["ieee80211w"] = Value(pmf);
++    values["multi_ap"] = Value(std::to_string((bss.backhaul ? 1 : 0) |
++                                              (bss.fronthaul ? 2 : 0)));
++    values["start_disabled"] = Value("0");
++    values["wds"] = Value(bss.backhaul ? "1" : "0");
++    if (bss.hidden_ssid != WSC::eWscVendorExtHiddenSsid::UNSET) {
++        values["hidden"] = Value(bss.hidden_ssid == WSC::eWscVendorExtHiddenSsid::ENABLED ? "1" : "0");
++    }
++    values["wps_pushbutton"] = Value(bss.fronthaul ? "1" : "0");
++    values["wps_state"] = Value(bss.fronthaul ? "2" : "0");
++    return true;
++}
++
++bool matches_owned_bss(const Options &candidate, const Options &primary,
++                       const Options &device,
++                       const son::wireless_utils::sBssInfoConf &bss,
++                       const std::string &backhaul_ssid, const std::string &backhaul_key)
++{
++    Options wanted;
++    if (bss.teardown || !credentials(bss, wanted) ||
++        !native_security_policy(candidate, device, wanted)) return false;
++    wanted["multi_ap_backhaul_ssid"] = Value(bss.fronthaul ? backhaul_ssid : "");
++    wanted["multi_ap_backhaul_key"] = Value(bss.fronthaul ? backhaul_key : "");
++    for (const auto &value : wanted)
++        if (text(candidate, value.first) != text(wanted, value.first)) return false;
++    for (const auto &name : credential_overrides)
++        if (candidate.count(name)) return false;
++    auto network = candidate.find("network");
++    auto primary_network = primary.find("network");
++    if ((network == candidate.end()) != (primary_network == primary.end()) ||
++        (network != candidate.end() && !(network->second == primary_network->second))) return false;
++    const auto profile = std::to_string(
++        (bss.profile1_backhaul_sta_association_disallowed ? 1 : 0) |
++        (bss.profile2_backhaul_sta_association_disallowed ? 2 : 0));
++    const auto id = raw_value(candidate, "config_id");
++    return raw_value(candidate, "multi_ap_client_disallow") == profile &&
++           id.size() == 64 && id.find_first_not_of("0123456789abcdef") == std::string::npos;
++}
++
++} // namespace
++
++bool bpl_cfg_apply_wifi_configuration(
++    const std::string &radio_iface,
++    const std::unordered_map<std::string, std::string> &bss_ifnames,
++    const std::list<son::wireless_utils::sBssInfoConf> &configuration,
++    const std::string &backhaul_ssid, const std::string &backhaul_key,
++    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> &expected_config_ids)
++{
++    expected_config_ids.clear();
++    if (std::any_of(backhaul_key.begin(), backhaul_key.end(),
++                    [](unsigned char c) { return c < 0x20 || c == 0x7f; })) {
++        return false;
++    }
++    std::string primary_section;
++    WirelessTransaction transaction;
++    Sections current;
++    if (!transaction.open() || !transaction.read(current) ||
++        !primary_ap(current, radio_iface, primary_section)) {
++        return false;
++    }
++    auto primary = current.find(primary_section);
++    if (primary == current.end() || text(primary->second, ".type") != "wifi-iface" ||
++        text(primary->second, "mode") != "ap" ||
++        text(primary->second, "ifname") != radio_iface) {
++        return false;
++    }
++    const auto device = text(primary->second, "device");
++    if (device.empty() || !current.count(device) ||
++        text(current.at(device), ".type") != "wifi-device") {
++        return false;
++    }
++
++    transaction.bind(primary_section);
++    Sections updates;
++    std::set<std::string> used;
++    std::set<std::string> new_sections;
++    std::map<std::string, std::vector<std::string>> removals;
++    std::set<std::string> reserved_ifnames;
++    for (const auto &bss : configuration) {
++        auto named = bss_ifnames.find(tlvf::mac_to_string(bss.bssid));
++        if (named != bss_ifnames.end()) reserved_ifnames.insert(named->second);
++    }
++    for (const auto &bss : configuration) {
++        std::string section;
++        auto iface = bss_ifnames.find(tlvf::mac_to_string(bss.bssid));
++        if (iface != bss_ifnames.end()) {
++            if (iface->second == radio_iface) {
++                section = primary_section;
++            } else {
++                for (const auto &candidate : current) {
++                    if (text(candidate.second, "ifname") == iface->second) {
++                        section = candidate.first;
++                        break;
++                    }
++                }
++            }
++        } else if (tlvf::mac_to_string(bss.bssid) == net::network_utils::WILD_MAC_STRING) {
++            // Reconcile a committed new BSS before allocating another. Exact
++            // requested semantics and one-use-per-request preserve multiplicity,
++            // including two distinct APs with the same SSID and credentials.
++            for (const auto &candidate : current) {
++                if (candidate.first.rfind("prplmesh_" + primary_section + "_", 0) == 0 &&
++                    text(candidate.second, ".type") == "wifi-iface" &&
++                    text(candidate.second, "mode") == "ap" &&
++                    text(candidate.second, "device") == device &&
++                    !enabled(candidate.second, "disabled") &&
++                    !used.count(candidate.first) &&
++                    !reserved_ifnames.count(text(candidate.second, "ifname")) &&
++                    matches_owned_bss(candidate.second, primary->second, current.at(device),
++                                      bss, backhaul_ssid, backhaul_key)) {
++                    section = candidate.first;
++                    break;
++                }
++            }
++            // A disabled BSS remains an owned, reusable slot after teardown.
++            for (const auto &candidate : current) {
++                if (section.empty() &&
++                    text(candidate.second, ".type") == "wifi-iface" &&
++                    text(candidate.second, "mode") == "ap" &&
++                    text(candidate.second, "device") == device &&
++                    text(candidate.second, "start_disabled") == "1" &&
++                    text(candidate.second, "disabled") != "1" &&
++                    text(candidate.second, "disabled") != "true" &&
++                    (candidate.first == primary_section ||
++                     candidate.first.rfind("prplmesh_" + primary_section + "_", 0) == 0) &&
++                    !used.count(candidate.first) &&
++                    !reserved_ifnames.count(text(candidate.second, "ifname"))) {
++                    section = candidate.first;
++                    break;
++                }
++            }
++            if (section.empty() && !bss.teardown) {
++                for (int id = IFACE_VAP_ID_MIN; id <= IFACE_VAP_ID_MAX; ++id) {
++                    const auto ifname = utils::get_iface_string_from_iface_vap_ids(radio_iface, id);
++                    const auto name = "prplmesh_" + primary_section + "_" + std::to_string(id);
++                    const bool taken = std::any_of(
++                        current.begin(), current.end(), [&](const Sections::value_type &entry) {
++                            return text(entry.second, "ifname") == ifname;
++                        });
++                    if (ifname.empty() || ifname == radio_iface || taken || current.count(name) || new_sections.count(name)) {
++                        continue;
++                    }
++                    section = name;
++                    auto &options = updates[section];
++                    options["device"] = Value(device);
++                    options["mode"] = Value("ap");
++                    options["ifname"] = Value(ifname);
++                    if (primary->second.count("network")) {
++                        options["network"] = primary->second.at("network");
++                    }
++                    new_sections.insert(section);
++                    break;
++                }
++            }
++        }
++        if (section.empty() || !used.insert(section).second) {
++            LOG(ERROR) << "Cannot bind Controller BSS to an owned OpenWrt AP section";
++            return false;
++        }
++        if (!new_sections.count(section) &&
++            (text(current.at(section), "device") != device ||
++             text(current.at(section), "mode") != "ap")) {
++            return false;
++        }
++
++        auto &values = updates[section];
++        if (!credentials(bss, values) ||
++            !native_security_policy(current.count(section) ? current.at(section) : Options{},
++                                    current.at(device), values)) {
++            return false;
++        }
++        if (!bss.teardown) {
++            removals[section] = credential_overrides;
++            if (text(values, "encryption") == "none") {
++                removals[section].push_back("key");
++            }
++            values["multi_ap_backhaul_ssid"] = Value(bss.fronthaul ? backhaul_ssid : "");
++            values["multi_ap_backhaul_key"] = Value(bss.fronthaul ? backhaul_key : "");
++
++        }
++        Value raw = unrelated_options(current.count(section) ? current.at(section) : Options{});
++        raw.strings.emplace_back("notify_mgmt_frames=1");
++        if (!bss.teardown) {
++            raw.strings.emplace_back("multi_ap_client_disallow=" +
++                std::to_string((bss.profile1_backhaul_sta_association_disallowed ? 1 : 0) |
++                               (bss.profile2_backhaul_sta_association_disallowed ? 2 : 0)));
++        }
++        values["hostapd_bss_options"] = raw;
++
++        // hostapd exposes config_id through GET_CONFIG. Tie completion to
++        // the loaded native BSS configuration, including same-SSID rekeys.
++        Options desired = current.count(section) ? current.at(section) : Options{};
++        for (const auto &value : values) {
++            desired[value.first] = value.second;
++        }
++        for (const auto &name : removals[section]) {
++            desired.erase(name);
++        }
++        std::string canonical;
++        for (const auto &option : desired) {
++            if (option.first[0] == '.') {
++                continue;
++            }
++            canonical += std::to_string(option.first.size()) + ":" + option.first +
++                         (option.second.list ? "L" : "S");
++            for (const auto &value : option.second.strings) {
++                canonical += std::to_string(value.size()) + ":" + value;
++            }
++            canonical += ";";
++        }
++        mapf::encryption::sha256 hash;
++        hash.update(reinterpret_cast<const uint8_t *>(canonical.data()), canonical.size());
++        uint8_t digest[32];
++        if (!hash.digest(digest)) {
++            return false;
++        }
++        std::string id;
++        constexpr char hex[] = "0123456789abcdef";
++        for (auto value : digest) {
++            id += hex[value >> 4];
++            id += hex[value & 15];
++        }
++        raw.strings.emplace_back("config_id=" + id);
++        values["hostapd_bss_options"] = std::move(raw);
++        auto &expected = expected_config_ids[text(desired, "ifname")];
++        expected["config_id"] = id;
++        expected["start_disabled"] = bss.teardown ? "1" : "0";
++        expected["start_deferred"] = "0";
++        expected["beacon_set"] = bss.teardown ? "0" : "1";
++        if (!bss.teardown) {
++            expected["multi_ap_client_disallow"] =
++                std::to_string((bss.profile1_backhaul_sta_association_disallowed ? 1 : 0) |
++                               (bss.profile2_backhaul_sta_association_disallowed ? 2 : 0));
++            if (!expected_security(desired, expected)) {
++                return false;
++            }
++            if (bss.fronthaul && !backhaul_ssid.empty()) {
++                expected["multi_ap_backhaul_ssid_hex"] =
++                    hex_string(reinterpret_cast<const unsigned char *>(backhaul_ssid.data()),
++                               backhaul_ssid.size());
++                if (backhaul_key.size() == 64) {
++                    auto key = backhaul_key;
++                    std::transform(key.begin(), key.end(), key.begin(),
++                                   [](unsigned char c) { return std::tolower(c); });
++                    expected["multi_ap_backhaul_wpa_psk"] = key;
++                } else {
++                    expected["multi_ap_backhaul_wpa_passphrase"] = backhaul_key;
++                }
++            }
++        }
++    }
++
++    return transaction.publish(updates, removals);
++}
++
++bool bpl_cfg_set_wifi_channel(const std::string &radio_iface, int channel,
++                              beerocks::eWiFiBandwidth bandwidth)
++{
++    std::string section;
++    WirelessTransaction transaction;
++    Sections current;
++    if (!transaction.open() || !transaction.read(current) ||
++        !primary_ap(current, radio_iface, section)) {
++        return false;
++    }
++    const auto device = text(current.at(section), "device");
++    if (device.empty() || !current.count(device) ||
++        text(current.at(device), ".type") != "wifi-device") {
++        return false;
++    }
++    transaction.bind(section);
++    Options values;
++    values["channel"] = Value(std::to_string(channel));
++    if (bandwidth != eWiFiBandwidth::BANDWIDTH_UNKNOWN) {
++        auto mode = text(current.at(device), "htmode");
++        const auto digits = mode.find_first_of("0123456789");
++        if (digits == std::string::npos) {
++            return false;
++        }
++        std::string width;
++        switch (bandwidth) {
++        case eWiFiBandwidth::BANDWIDTH_20: width = "20"; break;
++        case eWiFiBandwidth::BANDWIDTH_40: width = "40"; break;
++        case eWiFiBandwidth::BANDWIDTH_80: width = "80"; break;
++        case eWiFiBandwidth::BANDWIDTH_160: width = "160"; break;
++        default: return false;
++        }
++        values["htmode"] = Value(mode.substr(0, digits) + width);
++    }
++    return transaction.publish({{device, values}});
++}
++
++} // namespace bpl
++} // namespace beerocks
+--- a/framework/platform/bpl/include/bpl/bpl_cfg.h
++++ b/framework/platform/bpl/include/bpl/bpl_cfg.h
+@@ -18,6 +18,7 @@
+ #include <net/if.h>
+ #include <stdint.h>
+ #include <string>
++#include <unordered_map>
+ 
+ namespace beerocks {
+ namespace nbapi {
+@@ -959,6 +960,22 @@
+ bool bpl_cfg_get_wifi_credentials(const std::string &iface,
+                                   son::wireless_utils::sBssInfoConf &configuration);
+ 
++#ifdef PRPLMESH_STOCK_OPENWRT_UCI
++/** Persist Controller BSS configuration through rpcd's native wireless owner.
++ * Netifd owns hostapd creation and reload. Success confirms publication, while
++ * the caller must still observe the resulting live BSS configuration.
++ */
++bool bpl_cfg_apply_wifi_configuration(
++    const std::string &radio_iface,
++    const std::unordered_map<std::string, std::string> &bss_ifnames,
++    const std::list<son::wireless_utils::sBssInfoConf> &configuration,
++    const std::string &backhaul_ssid, const std::string &backhaul_key,
++    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> &expected_config_ids);
++bool bpl_cfg_set_wifi_channel(const std::string &radio_iface, int channel,
++                              beerocks::eWiFiBandwidth bandwidth);
++#endif
++
++
+ /**
+  * @brief Reads MLD configuration from Device.WiFi.APMLD.*.MLDConfig for a given mld_id 
+  *
