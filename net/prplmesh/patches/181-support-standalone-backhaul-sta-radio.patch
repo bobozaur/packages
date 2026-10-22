@@ -2607,3 +2607,59 @@ and AP+STA APIs and native UCI/supplicant ownership.
  /****************************************************************************/
  /******************************** Functions *********************************/
  /****************************************************************************/
+
+--- a/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
++++ b/framework/platform/bpl/cfg/uci/bpl_cfg.cpp
+@@ -21,6 +21,11 @@
+ #include <mapf/common/utils.h>
+ 
+ #include <fstream>
++#include <memory>
++
++extern "C" {
++#include <uci.h>
++}
+ 
+ using namespace mapf;
+ 
+@@ -794,16 +799,32 @@
+ 
+ bool bpl_cfg_get_backhaul_wire_iface(std::string &iface)
+ {
++    auto ctx = std::unique_ptr<uci_context, decltype(&uci_free_context)>(
++        uci_alloc_context(), &uci_free_context);
++    if (!ctx) {
++        return false;
++    }
++
++    char path[] = "prplmesh.config.backhaul_wire_iface";
++    struct uci_ptr ptr = {};
++    if (uci_lookup_ptr(ctx.get(), &ptr, path, true) != UCI_OK || !ptr.p || !ptr.s) {
++        MAPF_ERR("bpl_cfg_get_backhaul_wire_iface: Failed to load prplmesh.config\n");
++        return false;
++    }
++
++    // Native UCI removes empty scalars. An omitted optional list has no wired candidates.
++    if (!ptr.o) {
++        iface.clear();
++        return true;
++    }
++    if (ptr.o->type != UCI_TYPE_STRING) {
++        MAPF_ERR("bpl_cfg_get_backhaul_wire_iface: Expected a scalar interface list\n");
++        return false;
++    }
++
+     char ifname[IFNAMSIZ + 1] = {0};
+-
+-    int retVal = cfg_get_prplmesh_param("backhaul_wire_iface", ifname, IFNAMSIZ);
+-    if (retVal == RETURN_ERR) {
+-        MAPF_ERR("bpl_cfg_get_backhaul_wire_iface: Failed to read backhaul_wire_iface parameter\n");
+-        return false;
+-    }
+-
++    strncpy_s(ifname, IFNAMSIZ, ptr.o->v.string, IFNAMSIZ - 1);
+     iface = ifname;
+-
+     return true;
+ }
+ 
