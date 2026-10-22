@@ -13,10 +13,11 @@ and AP+STA APIs and native UCI/supplicant ownership.
 
 --- a/agent/src/beerocks/slave/agent_db.cpp
 +++ b/agent/src/beerocks/slave/agent_db.cpp
-@@ -10,8 +10,139 @@
+@@ -10,8 +10,158 @@
  
  #include <bpl/bpl_cfg.h>
  #include <easylogging++.h>
++#include <cstring>
 +#ifdef PRPLMESH_STOCK_OPENWRT_UCI
 +#include <bwl/nl80211_client_factory.h>
 +#include <linux/nl80211.h>
@@ -114,9 +115,12 @@ and AP+STA APIs and native UCI/supplicant ownership.
 +        const auto rx = band->mcs_map_nss(band->he_mcs_set),
 +                   tx = band->mcs_map_nss(band->he_mcs_set + 2);
 +        if (!rx || !tx) return false;
-+        auto &he = *reinterpret_cast<net::sHECapabilities *>(&radio.he_capability);
++        net::sHECapabilities he{};
++        static_assert(sizeof(he) == sizeof(radio.he_capability), "HE capability storage size");
++        std::memcpy(&he, &radio.he_capability, sizeof(he));
 +        he.max_num_of_supported_rx_spatial_streams = rx - 1;
 +        he.max_num_of_supported_tx_spatial_streams = tx - 1;
++        std::memcpy(&radio.he_capability, &he, sizeof(he));
 +    }
 +    radio.wifi6_capability = band->wifi6_capability;
 +    std::copy_n(band->he_mcs_set, radio.he_mcs_set.size(), radio.he_mcs_set.begin());
@@ -126,7 +130,22 @@ and AP+STA APIs and native UCI/supplicant ownership.
 +        const auto &channel = entry.second;
 +        auto &out = radio.channels_list[entry.first];
 +        out.tx_power_dbm = channel.tx_power;
-+        out.dfs_state = channel.is_dfs ? channel.dfs_state : beerocks_message::eDfsState::DFS_STATE_MAX;
++        out.dfs_state = beerocks_message::eDfsState::NOT_DFS;
++        if (channel.is_dfs) {
++            switch (channel.dfs_state) {
++            case eDfsState::USABLE:
++                out.dfs_state = beerocks_message::eDfsState::USABLE;
++                break;
++            case eDfsState::UNAVAILABLE:
++                out.dfs_state = beerocks_message::eDfsState::UNAVAILABLE;
++                break;
++            case eDfsState::AVAILABLE:
++                out.dfs_state = beerocks_message::eDfsState::AVAILABLE;
++                break;
++            default:
++                return false;
++            }
++        }
 +        for (auto width : channel.supported_bandwidths) {
 +            beerocks_message::sSupportedBandwidth bw{};
 +            bw.bandwidth = width;
@@ -2122,6 +2141,17 @@ and AP+STA APIs and native UCI/supplicant ownership.
          m_radio_info.he_supported     = band_info_it->he_supported;
          m_radio_info.he_capability    = band_info_it->he_capability;
          m_radio_info.wifi6_capability = band_info_it->wifi6_capability;
+@@ -1740,10 +1753,6 @@
+     }
+ 
+     switch (event) {
+-    case Event::Interface_Disabled:
+-        event_queue_push(Event::Interface_Disabled);
+-        return true;
+-
+     case Event::AP_MGMT_FRAME_RECEIVED: {
+         if (parsed_obj.find("buf") == parsed_obj.end() || parsed_obj["buf"].empty()) {
+             LOG(ERROR) << "Management frame without data!";
 --- a/common/beerocks/bwl/shared/nl80211_client_impl.cpp
 +++ b/common/beerocks/bwl/shared/nl80211_client_impl.cpp
 @@ -33,6 +33,11 @@
