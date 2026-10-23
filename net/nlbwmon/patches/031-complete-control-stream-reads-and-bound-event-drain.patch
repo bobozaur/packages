@@ -1,0 +1,371 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] Complete control frames without monopolizing the native event loop
+
+Assemble stream replies across short reads and interruptions. A partial EOF
+remains an error, socket errors survive, and descriptor zero remains valid.
+Queue control output through libubox ustream instead of spinning on EAGAIN on
+an accepted nonblocking socket. Retain the single native client owner and its
+existing inactivity timeout, closing only after output drains or fails.
+
+Bound one level-triggered conntrack event turn to 32 datagrams so continuous
+events cannot indefinitely exclude queued shutdown signals and control I/O.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/client.c
++++ b/client.c
+@@ -211,17 +211,40 @@
+ 		putchar(client_opt.quote);
+ }
+ 
++/* A Unix stream may split the database header or a record across reads. */
++static ssize_t
++recv_data(int sock, void *buf, size_t len)
++{
++	ssize_t rv;
++	size_t received = 0;
++
++	while (received < len) {
++		rv = recv(sock, (char *)buf + received, len - received, 0);
++		if (rv < 0) {
++			if (errno == EINTR)
++				continue;
++			return -errno;
++		}
++		if (!rv)
++			break;
++		received += rv;
++	}
++
++	return received;
++}
++
+ static int
+ recv_database(struct dbhandle **h)
+ {
+ 	int i, len, err, ctrl_socket;
++	ssize_t received;
+ 	struct database db;
+ 	struct record rec;
+ 	char req[sizeof("dump YYYYMMDD\0")];
+ 
+ 	ctrl_socket = usock(USOCK_UNIX, opt.socket, NULL);
+ 
+-	if (!ctrl_socket)
++	if (ctrl_socket < 0)
+ 		return -errno;
+ 
+ 	len = snprintf(req, sizeof(req), "dump %d", client_opt.timestamp);
+@@ -231,9 +254,10 @@
+ 		return -errno;
+ 	}
+ 
+-	if (recv(ctrl_socket, &db, sizeof(db), 0) != sizeof(db)) {
++	received = recv_data(ctrl_socket, &db, sizeof(db));
++	if (received != sizeof(db)) {
+ 		close(ctrl_socket);
+-		return -ENODATA;
++		return received < 0 ? received : -ENODATA;
+ 	}
+ 
+ 	*h = database_mem(cmp_fn, client_opt.group_by);
+@@ -244,15 +268,20 @@
+ 	}
+ 
+ 	for (i = 0; i < db_entries(&db); i++) {
+-		if (recv(ctrl_socket, &rec, db_recsize, 0) != db_recsize) {
++		received = recv_data(ctrl_socket, &rec, db_recsize);
++		if (received != db_recsize) {
+ 			close(ctrl_socket);
+-			return -ENODATA;
++			database_free(*h);
++			*h = NULL;
++			return received < 0 ? received : -ENODATA;
+ 		}
+ 
+ 		err = database_insert(*h, &rec);
+ 
+ 		if (err != 0) {
+ 			close(ctrl_socket);
++			database_free(*h);
++			*h = NULL;
+ 			return err;
+ 		}
+ 	}
+@@ -605,10 +634,11 @@
+ handle_list(void)
+ {
+ 	int ctrl_socket;
++	ssize_t received;
+ 
+ 	ctrl_socket = usock(USOCK_UNIX, opt.socket, NULL);
+ 
+-	if (!ctrl_socket)
++	if (ctrl_socket < 0)
+ 		return -errno;
+ 
+ 	if (send(ctrl_socket, "list", 4, 0) != 4) {
+@@ -617,9 +647,14 @@
+ 	}
+ 
+ 	while (true) {
+-		if (recv(ctrl_socket, &client_opt.timestamp,
+-		         sizeof(client_opt.timestamp), 0) <= 0)
+-			break;
++		received = recv_data(ctrl_socket, &client_opt.timestamp,
++		                     sizeof(client_opt.timestamp));
++		if (!received)
++			break;
++		if (received != sizeof(client_opt.timestamp)) {
++			close(ctrl_socket);
++			return received < 0 ? received : -ENODATA;
++		}
+ 
+ 		printf("%04d-%02d-%02d\n",
+ 		       client_opt.timestamp / 10000,
+@@ -637,10 +672,11 @@
+ {
+ 	char reply[128] = { };
+ 	int ctrl_socket;
++	ssize_t received;
+ 
+ 	ctrl_socket = usock(USOCK_UNIX, opt.socket, NULL);
+ 
+-	if (!ctrl_socket)
++	if (ctrl_socket < 0)
+ 		return -errno;
+ 
+ 	if (send(ctrl_socket, "commit", 6, 0) != 6) {
+@@ -648,9 +684,10 @@
+ 		return -errno;
+ 	}
+ 
+-	if (recv(ctrl_socket, reply, sizeof(reply)-1, 0) <= 0) {
++	received = recv_data(ctrl_socket, reply, sizeof(reply)-1);
++	if (received <= 0) {
+ 		close(ctrl_socket);
+-		return -ENODATA;
++		return received < 0 ? received : -ENODATA;
+ 	}
+ 
+ 	printf("%s\n", reply);
+--- a/socket.c
++++ b/socket.c
+@@ -25,6 +25,7 @@
+ #include <sys/socket.h>
+ 
+ #include <libubox/uloop.h>
++#include <libubox/ustream.h>
+ #include <libubox/usock.h>
+ 
+ #include "socket.h"
+@@ -40,27 +41,24 @@
+ static int ctrl_socket;
+ static struct uloop_fd sock_fd = { };
+ static struct uloop_timeout sock_tm = { };
++static struct ustream_fd client = { };
++static bool client_active, request_handled;
+ 
+ 
+ static ssize_t
+ send_data(int sock, const void *buf, size_t len)
+ {
+-	ssize_t rv, sent = 0;
+-
+-	while (len) {
+-		rv = send(sock, buf + sent, len, 0);
+-
+-		if (rv == -1 && errno == EAGAIN)
+-			continue;
+-
+-		if (rv <= 0)
+-			return rv;
+-
+-		len -= rv;
+-		sent += rv;
+-	}
+-
+-	return sent;
++	int written;
++
++	if (!client_active || sock != client.fd.fd) {
++		errno = EBADF;
++		return -1;
++	}
++
++	written = ustream_write(&client.stream, buf, len, false);
++	if (written >= 0 && written != len)
++		errno = client.stream.write_error ? EPIPE : ENOMEM;
++	return written;
+ }
+ 
+ static int
+@@ -132,7 +130,7 @@
+ 			break;
+ 		}
+ 
+-		if (send(sock, &timestamp, sizeof(timestamp), 0) != sizeof(timestamp))
++		if (send_data(sock, &timestamp, sizeof(timestamp)) != sizeof(timestamp))
+ 			return -errno;
+ 	}
+ 
+@@ -164,46 +162,81 @@
+ 
+ 
+ static void
+-handle_client_accept(struct uloop_fd *ufd, unsigned int ev);
+-
+-static void
+ handle_client_timeout(struct uloop_timeout *tm)
+ {
++	if (!client_active)
++		return;
++
++	client_active = false;
+ 	uloop_timeout_cancel(&sock_tm);
+-
+-	uloop_fd_delete(&sock_fd);
+-	close(sock_fd.fd);
+-
+-	sock_fd.cb = handle_client_accept;
+-	sock_fd.fd = ctrl_socket;
+-
++	ustream_free(&client.stream);
++	close(client.fd.fd);
+ 	uloop_fd_add(&sock_fd, ULOOP_READ);
+ }
+ 
+ static void
+-handle_client_request(struct uloop_fd *ufd, unsigned int ev)
+-{
+-	char *cmd, *arg, buf[32] = { };
+-	size_t len;
+-	int i, err;
+-
+-	len = recv(ufd->fd, buf, sizeof(buf) - 1, 0);
+-
+-	if (len > 0) {
+-		cmd = strtok(buf, " \t\n");
+-		arg = strtok(NULL, " \t\n");
+-
+-		for (i = 0; i < sizeof(commands) / sizeof(commands[0]); i++)
+-			if (!strcmp(commands[i].cmd, cmd)) {
+-				err = commands[i].cb(ufd->fd, arg);
+-				if (err) {
+-					fprintf(stderr, "Unable to handle '%s' command: %s\n",
+-					        buf, strerror(-err));
+-				}
+-			}
+-	}
+-
+-	handle_client_timeout(&sock_tm);
++handle_client_write(struct ustream *stream, int bytes)
++{
++	if (request_handled && !ustream_pending_data(stream, true)) {
++		handle_client_timeout(&sock_tm);
++		return;
++	}
++
++	if (bytes)
++		uloop_timeout_set(&sock_tm, 100);
++}
++
++static void
++handle_client_state(struct ustream *stream)
++{
++	if (stream->write_error ||
++	    (stream->eof && (!request_handled ||
++	                     !ustream_pending_data(stream, true))))
++		handle_client_timeout(&sock_tm);
++}
++
++static void
++handle_client_request(struct ustream *stream, int bytes)
++{
++	char *cmd, *arg, *data, buf[32] = { };
++	int i, len, err = 0;
++
++	if (request_handled)
++		return;
++
++	data = ustream_get_read_buf(stream, &len);
++	if (!data || len <= 0)
++		return;
++	if (len >= sizeof(buf)) {
++		handle_client_timeout(&sock_tm);
++		return;
++	}
++
++	memcpy(buf, data, len);
++	ustream_consume(stream, len);
++	ustream_set_read_blocked(stream, true);
++	request_handled = true;
++
++	cmd = strtok(buf, " \t\n");
++	arg = strtok(NULL, " \t\n");
++	if (cmd) {
++		for (i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
++			if (strcmp(commands[i].cmd, cmd))
++				continue;
++			err = commands[i].cb(client.fd.fd, arg);
++			if (err)
++				fprintf(stderr, "Unable to handle '%s' command: %s\n",
++				        cmd, strerror(-err));
++			break;
++		}
++	}
++
++	/* Keep one native control owner until its queued response drains. A slow
++	 * client must not busy-spin in send(EAGAIN) and exclude shutdown signals. */
++	if (err || !ustream_pending_data(stream, true))
++		handle_client_timeout(&sock_tm);
++	else
++		uloop_timeout_set(&sock_tm, 100);
+ }
+ 
+ static void
+@@ -212,16 +245,19 @@
+ 	int fd;
+ 
+ 	fd = accept(ufd->fd, NULL, NULL);
+-
+ 	if (fd < 0)
+ 		return;
+ 
+ 	uloop_fd_delete(ufd);
+-
+-	ufd->cb = handle_client_request;
+-	ufd->fd = fd;
+-
+-	uloop_fd_add(ufd, ULOOP_READ);
++	memset(&client, 0, sizeof(client));
++	client_active = true;
++	request_handled = false;
++	client.stream.notify_read = handle_client_request;
++	client.stream.notify_write = handle_client_write;
++	client.stream.notify_state = handle_client_state;
++	client.stream.r.buffer_len = 32;
++	client.stream.r.max_buffers = 1;
++	ustream_fd_init(&client, fd);
+ 
+ 	sock_tm.cb = handle_client_timeout;
+ 	uloop_timeout_set(&sock_tm, 100);
+--- a/nfnetlink.c
++++ b/nfnetlink.c
+@@ -291,11 +291,13 @@
+ 	struct nlmsghdr *hdr;
+ 	unsigned char *msg;
+ 	bool is_new;
+-	int len;
++	int len, batches;
+ 
+ 	database_archive(gdbh);
+ 
+-	while (true) {
++	/* Leave queued signals, timers and control requests an event-loop turn.
++	 * The level-triggered socket will report any remaining datagrams. */
++	for (batches = 0; batches < 32; batches++) {
+ 		len = nl_recv(nl, &peer, &msg, NULL);
+ 
+ 		if (len <= 0)

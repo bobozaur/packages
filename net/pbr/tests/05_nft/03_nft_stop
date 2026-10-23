@@ -1,0 +1,224 @@
+#!/bin/bash
+# Exercise production stop against real nftables in a disposable network namespace.
+if [ "${PBR_NFT_TEST_NAMESPACE:-}" != 1 ]; then
+	command -v nft >/dev/null && unshare -Urn true 2>/dev/null || {
+		echo 'SKIP: nftables or unprivileged network namespaces unavailable'
+		exit 0
+	}
+	exec env PBR_NFT_TEST_NAMESPACE=1 unshare -Urn bash "$0"
+fi
+
+REAL_NFT="$(command -v nft)"
+. "$(dirname "$0")/../lib/setup.sh"
+nft="$REAL_NFT"
+
+oneTimeTearDown() { rm -rf "${MOCK_ROOT:-}"; }
+load_environment() { :; }
+json() { :; }
+output() { :; }
+output_okn() { :; }
+output_failn() { :; }
+ip() { echo "ip $*" >> "$MOCK_ROOT/side-effects"; }
+resolver() {
+	echo "resolver $*" >> "$MOCK_ROOT/side-effects"
+	[ "$1" != compare_hash ]
+}
+
+# Model fw4's flush/repopulate contract using real nft, including other owners.
+fw4() {
+	[ "$FAIL_RELOAD" = 0 ] || return 1
+	"$nft" flush table inet "$nftTable" || return 1
+	"$nft" add rule inet "$nftTable" forward ip daddr @pbr_foreign_set accept || return 1
+	if [ "$RETAIN_REFERENCE" = 1 ]; then
+		"$nft" add rule inet "$nftTable" forward ip daddr @pbr_wan_4_dst_ip_test accept || return 1
+	fi
+	[ ! -s "$nftNetifdFile" ] || "$nft" -f "$nftNetifdFile" || return 1
+	[ ! -s "$nftMainFile" ] || "$nft" -f "$nftMainFile"
+}
+
+setUp() {
+	FAIL_RELOAD=0
+	RETAIN_REFERENCE=0
+	rm -f "$nftMainFile" "$nftTempFile" "$nftStopFile" "$nftNetifdFile" "$MOCK_ROOT/side-effects"
+	serviceStopResult=0
+	loadPackageConfigFlag=
+	load_package_config
+	"$nft" flush ruleset
+	"$nft" -f - <<EOF
+table inet $nftTable {
+	chain forward { }
+	chain dstnat { }
+	chain mangle_forward { }
+	chain mangle_output { }
+	chain mangle_prerouting { }
+	chain pbr_foreign_chain { }
+	set pbr_foreign_set { type ipv4_addr; elements = { 192.0.2.1 }; }
+}
+EOF
+	nft_file create main
+	nft add chain inet "$nftTable" pbr_mark_0x010000
+	nft add rule inet "$nftTable" pbr_mark_0x010000 meta mark set 0x010000
+	nft add set inet "$nftTable" pbr_wan_4_dst_ip_test '{ type ipv4_addr; }'
+	nft add rule inet "$nftTable" pbr_prerouting ip daddr @pbr_wan_4_dst_ip_test goto pbr_mark_0x010000
+	nft_file install main
+}
+
+testStopRemovesOwnedObjectsAndPreservesOtherOwners() {
+	assertTrue 'installed marking state reports active' is_service_running
+	assertTrue 'stop succeeds' 'stop_service quiet'
+	assertFalse 'stopped main policy reports inactive' is_service_running
+	assertFalse 'owned policy chain removed' 'nft_call list chain inet "$nftTable" pbr_prerouting'
+	assertFalse 'owned set removed' 'nft_call list set inet "$nftTable" pbr_wan_4_dst_ip_test'
+	assertTrue 'foreign prefixed chain retained' 'nft_call list chain inet "$nftTable" pbr_foreign_chain'
+	assertTrue 'foreign prefixed populated set retained' '"$nft" list set inet "$nftTable" pbr_foreign_set | grep -q 192.0.2.1'
+	assertFalse 'completed withdrawal record removed' '[ -e "$nftStopFile" ]'
+}
+
+testStopRetainsNetifdObjectsAndTheirActiveStatus() {
+	cat > "$nftNetifdFile" <<EOF
+add chain inet $nftTable pbr_mark_0x010000
+add rule inet $nftTable pbr_mark_0x010000 meta mark set 0x010000
+add rule inet $nftTable pbr_prerouting ip dscp cs1 goto pbr_mark_0x010000
+EOF
+	assertTrue 'main policy stop succeeds with retained netifd state' 'stop_service quiet'
+	assertTrue 'netifd marks retain installed-state status' is_service_running
+	assertTrue 'referenced policy chain retained' 'nft_call list chain inet "$nftTable" pbr_prerouting'
+	assertFalse 'unreferenced policy chain removed' 'nft_call list chain inet "$nftTable" pbr_output'
+	assertFalse 'unreferenced set removed' 'nft_call list set inet "$nftTable" pbr_wan_4_dst_ip_test'
+	assertTrue 'netifd include retained' '[ -s "$nftNetifdFile" ]'
+}
+
+testReloadFailurePreservesOwnershipAndStopsFurtherCleanup() {
+	FAIL_RELOAD=1
+	assertFalse 'failed reload propagates' 'stop_service quiet'
+	assertTrue 'exact withdrawal record retained' 'grep -q "add set.*pbr_wan_4_dst_ip_test" "$nftStopFile"'
+	assertTrue 'live policy still reports active' is_service_running
+	assertFalse 'routes and resolver untouched on firewall failure' '[ -e "$MOCK_ROOT/side-effects" ]'
+	FAIL_RELOAD=0
+	assertTrue 'stop can retry' 'stop_service quiet'
+	assertFalse 'retry completes withdrawal' is_service_running
+}
+
+testPartialDeletionCanRetryWithoutMarksOrRoutes() {
+	RETAIN_REFERENCE=1
+	assertFalse 'foreign reference prevents owned set deletion' 'stop_service quiet'
+	assertFalse 'earlier marking chain removal completed' is_service_running
+	assertTrue 'partial cleanup retains exact ownership' '[ -s "$nftStopFile" ]'
+	assertTrue 'referenced set preserved' 'nft_call list set inet "$nftTable" pbr_wan_4_dst_ip_test'
+	RETAIN_REFERENCE=0
+	assertTrue 'record bypasses inactive-state early return' 'stop_service quiet'
+	assertFalse 'retry removes last owned set' 'nft_call list set inet "$nftTable" pbr_wan_4_dst_ip_test'
+}
+
+testDisabledReloadUsesStop() {
+	local original
+	original="$(cat "$packageConfigFile")"
+	sed -i "s/option enabled '1'/option enabled '0'/" "$packageConfigFile"
+	loadPackageConfigFlag=
+	assertTrue 'disabled reload withdraws applied state' 'start_service on_reload'
+	assertFalse 'disabled policy is stopped' is_service_running
+	printf '%s\n' "$original" > "$packageConfigFile"
+}
+
+testStartPreservesFailedWithdrawal() {
+	FAIL_RELOAD=1
+	stop_service quiet
+	assertFalse 'start retries and propagates withdrawal failure' start_service
+	assertTrue 'start retains exact ownership record' 'grep -q "add set.*pbr_wan_4_dst_ip_test" "$nftStopFile"'
+}
+
+testNetifdScratchDoesNotOverwriteFailedWithdrawal() {
+	FAIL_RELOAD=1
+	stop_service quiet
+	nft_file create netifd
+	nft add chain inet "$nftTable" pbr_mark_0x020000
+	nft_file install netifd
+	assertTrue 'netifd scratch leaves main ownership intact' 'grep -q "add set.*pbr_wan_4_dst_ip_test" "$nftStopFile"'
+	FAIL_RELOAD=0
+	assertTrue 'main withdrawal can still finish' 'stop_service quiet'
+	assertFalse 'old main set removed' 'nft_call list set inet "$nftTable" pbr_wan_4_dst_ip_test'
+	assertTrue 'new netifd mark retained' 'nft_call list chain inet "$nftTable" pbr_mark_0x020000'
+}
+
+make_public_entry() {
+	# Use the real command-dispatch helpers; keep only UCI access mocked.
+	printf '. %q\n. %q\n' \
+		"$PKG_DIR/../../../../package/base-files/files/lib/functions.sh" \
+		"$TESTS_DIR/lib/mocks/functions.sh" > "$MOCK_ROOT/lib/functions.sh"
+	: > "$MOCK_ROOT/lib/functions/service.sh"
+	: > "$MOCK_ROOT/lib/functions/procd.sh"
+	{
+		printf '. %q\n' "$_PBR_TEST_SCRIPT"
+		local var
+		for var in nft nftTempFile nftStopFile nftMainFile nftNetifdFile rtTablesFile runningStatusFile packageLockFile packageDnsmasqFile packageDebugFile packageConfigFile; do
+			printf '%s=%q\n' "$var" "${!var}"
+		done
+		declare -f fw4 load_environment json output output_okn output_failn ip resolver sync
+		declare -f procd_open_instance procd_set_param procd_close_instance procd_open_data procd_close_data
+		printf 'procd_lock() { :; }\nprocd_kill() { :; }\nprocd_set_config_changed() { :; }\n'
+		printf 'procd_open_service() { :; }\nprocd_close_service() { :; }\n'
+		printf 'stop_forward() { :; }\nenable_forward() { :; }\nload_package_config\n'
+	} > "$MOCK_ROOT/entry"
+}
+
+testPublicCommandFailuresPreserveOwnershipAndNoLock() {
+	local rc_common="$PKG_DIR/../../../../package/base-files/files/etc/rc.common"
+	[ -f "$rc_common" ] || { echo 'SKIP: OpenWrt rc.common source unavailable'; return; }
+	make_public_entry
+	FAIL_RELOAD=1
+	export FAIL_RELOAD RETAIN_REFERENCE MOCK_ROOT
+	local action
+	for action in stop start restart; do
+		assertFalse "$action propagates failure through real rc.common" 'bash "$rc_common" "$MOCK_ROOT/entry" "$action"'
+		assertTrue "$action retains withdrawal record" '[ -s "$nftStopFile" ]'
+		assertFalse "$action does not publish the interface-reload lock" '[ -e "$packageLockFile" ]'
+	done
+}
+
+testPublicRestartAndReloadPreserveForeignAndNetifdSets() {
+	local rc_common="$PKG_DIR/../../../../package/base-files/files/etc/rc.common"
+	[ -f "$rc_common" ] || { echo 'SKIP: OpenWrt rc.common source unavailable'; return; }
+	make_public_entry
+	# Supply one interface's generated policy at the network backend boundary.
+	# The public restart/reload, start_service and all nft lifecycle code stay real.
+	cat >> "$MOCK_ROOT/entry" <<'EOF'
+is_wan_up() { return 0; }
+load_validate_config() { echo 0; }
+is_config_enabled() { return 1; }
+is_tor_running() { return 1; }
+ubus_get_data() { :; }
+ubus_get_status() { echo test; }
+process_interface() {
+	[ "$2" = create_global_rules ] || return 0
+	nft add chain inet "$nftTable" pbr_mark_0x010000
+	nft add rule inet "$nftTable" pbr_mark_0x010000 meta mark set 0x010000
+	nft add set inet "$nftTable" "$PBR_TEST_POLICY_SET" '{ type ipv4_addr; }'
+	nft add element inet "$nftTable" "$PBR_TEST_POLICY_SET" '{ 192.0.2.20 }'
+	nft add rule inet "$nftTable" pbr_prerouting ip daddr "@$PBR_TEST_POLICY_SET" goto pbr_mark_0x010000
+	gatewaySummary=test
+}
+EOF
+	"$nft" add set inet "$nftTable" pbr_foreign_unhooked '{ type ipv4_addr; elements = { 192.0.2.123 }; }'
+	cat > "$nftNetifdFile" <<EOF
+add chain inet $nftTable pbr_mark_0x020000
+add rule inet $nftTable pbr_mark_0x020000 meta mark set 0x020000
+add set inet $nftTable pbr_netifd_set { type ipv4_addr; }
+EOF
+	"$nft" -f "$nftNetifdFile"
+	"$nft" add element inet "$nftTable" pbr_netifd_set '{ 192.0.2.200 }'
+	export FAIL_RELOAD RETAIN_REFERENCE MOCK_ROOT PBR_TEST_POLICY_SET
+	local action previous=pbr_wan_4_dst_ip_test
+	for action in restart reload; do
+		PBR_TEST_POLICY_SET="pbr_wan_4_dst_ip_$action"
+		assertTrue "public $action succeeds" 'bash "$rc_common" "$MOCK_ROOT/entry" "$action"'
+		assertTrue 'replacement policy set is populated' '"$nft" list set inet "$nftTable" "$PBR_TEST_POLICY_SET" | grep -q 192.0.2.20'
+		assertFalse 'obsolete owned set is removed' 'nft_call list set inet "$nftTable" "$previous"'
+		assertTrue 'unhooked foreign set retains its element' '"$nft" list set inet "$nftTable" pbr_foreign_unhooked | grep -q 192.0.2.123'
+		assertTrue 'referenced foreign set retains its element' '"$nft" list set inet "$nftTable" pbr_foreign_set | grep -q 192.0.2.1'
+		assertTrue 'netifd set retains its element' '"$nft" list set inet "$nftTable" pbr_netifd_set | grep -q 192.0.2.200'
+		assertTrue 'netifd mark is retained' 'nft_call list chain inet "$nftTable" pbr_mark_0x020000'
+		previous="$PBR_TEST_POLICY_SET"
+	done
+}
+
+. shunit2

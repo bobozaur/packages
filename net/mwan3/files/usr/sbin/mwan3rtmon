@@ -26,7 +26,7 @@ mwan3_add_all_routes()
 
 	add_active_tbls()
 	{
-		let tid++
+		mwan3_get_iface_id tid "$1"
 		config_get family "$1" family ipv4
 		config_get initial_state "$1" initial_state "online"
 		[ "$family" != "$ipv" ] && return
@@ -37,9 +37,9 @@ mwan3_add_all_routes()
 
 	add_route()
 	{
-		let tid++
+		mwan3_get_iface_id tid "$1"
 		[ -n "${active_tbls##* $tid *}" ] && return
-		error=$($IP route add table $tid $route_line 2>&1) ||
+		error=$(mwan3_route_change add "$tid" "$route_line" 2>&1) ||
 			LOG warn "failed to add $route_line to table $tid - error: $error"
 	}
 
@@ -59,7 +59,7 @@ mwan3_add_all_routes()
 	mwan3_get_routes | while read -r route_line; do
 		mwan3_route_line_dev "tid" "$route_line" "$ipv"
 		if [ -n "$tid" ] && [ -z "${active_tbls##* $tid *}" ]; then
-			$IP route add table $tid $route_line
+			mwan3_route_change add "$tid" "$route_line"
 		elif [ -n "${route_line##default*}" ] && [ -n "${route_line##fe80::/64*}" ]; then
 			config_foreach add_route interface
 		fi
@@ -68,7 +68,7 @@ mwan3_add_all_routes()
 
 mwan3_rtmon_route_handle()
 {
-	local action route_line family tbl device line tid
+	local action route_line route_family family tbl device line tid route_tid IP IPT
 
 	route_line=${1##"Deleted "}
 	route_family=$2
@@ -87,8 +87,10 @@ mwan3_rtmon_route_handle()
 
 	if [ "$route_family" = "ipv4" ]; then
 		IP="$IP4"
+		IPT="$IPT4"
 	elif [ "$route_family" = "ipv6" ] && [ $NO_IPV6 -eq 0 ]; then
 		IP="$IP6"
+		IPT="$IPT6"
 	else
 		LOG warn "route update called with invalid family - $route_family"
 		return
@@ -105,15 +107,15 @@ mwan3_rtmon_route_handle()
 	handle_route() {
 		local error
 		local iface=$1
-		tbl=$($IP route list table $tid 2>/dev/null)$'\n'
 
-		local status
-		mwan3_get_mwan3track_status status $iface
-
-		if [ -n "$iface" ] && [ "$status" != "active" ]; then
-			LOG debug "interface $iface is disabled - skipping '$route_line'";
+		# Probe health does not own the routing table. Untracked interfaces
+		# and restarting trackers still need current connected/LAN routes.
+		# ifdown removes this chain under the same procd lock as this update.
+		if ! $IPT -S "mwan3_iface_in_$iface" >/dev/null 2>&1; then
+			LOG debug "interface $iface has no active route owner - skipping '$route_line'"
 			return
 		fi
+		tbl=$($IP route list table $tid proto "$MWAN3_ROUTE_PROTOCOL" 2>/dev/null | sed -ne "$MWAN3_ROUTE_LINE_EXP")$'\n'
 
 		# check that action needs to be performed. May not need to take action if we
 		# got a delete event, but table was already flushed
@@ -124,59 +126,98 @@ mwan3_rtmon_route_handle()
 
 		network_get_device device "$iface"
 		LOG debug "adjusting route $device: '$IP route $action table $tid $route_line'"
-		error=$($IP route "$action" table $tid $route_line 2>&1)||
+		error=$(mwan3_route_change "$action" "$tid" "$route_line" 2>&1)||
 			LOG warn "failed: '$IP route $action table $tid $route_line' - error: $error"
 	}
 	handle_route_cb(){
 		local iface=$1
-		let tid++
+		mwan3_get_iface_id tid "$1"
 		config_get family "$iface" family ipv4
 		[ "$family" != "$route_family" ] && return
+		[ -z "$route_tid" ] || [ "$tid" = "$route_tid" ] || return
 		handle_route "$iface"
 	}
 
 	mwan3_update_dev_to_table
-	mwan3_route_line_dev "tid" "$route_line" "$route_family"
+	mwan3_route_line_dev "route_tid" "$route_line" "$route_family"
 
-	if [ -n "$tid" ]; then
-		handle_route
-	elif [ -n "${route_line##default*}" ] && [ -n "${route_line##fe80::/64*}" ]; then
+	if [ -n "$route_tid" ] ||
+	   { [ -n "${route_line##default*}" ] && [ -n "${route_line##fe80::/64*}" ]; }; then
 		config_foreach handle_route_cb interface
 	fi
 }
 
+# The init/hotplug procd lock also serializes monitor writers with teardown.
+# A queued event from an old service incarnation cannot publish into a new one.
+mwan3_rtmon_update()
+(
+	initscript=/etc/init.d/mwan3
+	. /lib/functions/procd.sh
+	procd_lock
+	[ "$(cat "$MWAN3_STATUS_DIR/owned" 2>/dev/null)" = "$owner" ] || exit 0
+	if [ "$1" = initial ]; then
+		mwan3_set_connected_${family}
+		mwan3_add_all_routes "$family"
+	else
+		mwan3_rtmon_route_handle "$2" "$family"
+	fi
+)
+
+# A printed PID precedes socket subscription. Establish readiness from the
+# monitor's actual netlink socket before copying routes, while events queue.
+mwan3_wait_route_monitor()
+{
+	local pid="$1" group="$2" attempt=0 fd inode subscribed
+
+	while [ "$attempt" -lt 5 ]; do
+		kill -0 "$pid" 2>/dev/null || return 1
+		for fd in /proc/"$pid"/fd/*; do
+			inode=$(readlink "$fd") || continue
+			case "$inode" in socket:\[*\]) inode=${inode#socket:[}; inode=${inode%]} ;; *) continue ;; esac
+			subscribed=$(awk -v inode="$inode" '$2 == 0 && $NF == inode {print $4}' /proc/net/netlink)
+			[ -n "$subscribed" ] && [ "$((0x$subscribed & group))" -ne 0 ] && return 0
+		done
+		attempt=$((attempt+1))
+		sleep 1
+	done
+	LOG err "Route monitor did not subscribe before its initial dump"
+	return 1
+}
+
 main()
 {
-	local IP family
+	local IP family owner group
 
 	mwan3_init
-
-	family=$1
-	[ -z $family ] && family=ipv4
-	if [ "$family" = "ipv6" ]; then
-		if [ $NO_IPV6 -ne 0 ]; then
-			LOG warn "mwan3rtmon started for ipv6, but ipv6 not enabled on system"
-			exit 1
-		fi
+	owner=$(cat "$MWAN3_STATUS_DIR/owned") || return 1
+	[ -n "$owner" ] || return 1
+	family=${1:-ipv4}
+	if [ "$family" = ipv6 ]; then
+		[ "$NO_IPV6" = 0 ] || return 1
 		IP="$IP6"
+		group=0x400
 	else
 		IP="$IP4"
+		group=0x40
 	fi
+	# Wait for the monitor subscription before the initial dump; route events
+	# queue in its pipe while copies are installed under the same owner lock.
 	sh -c "echo \$\$; exec $IP monitor route" | {
 		read -r monitor_pid
-		trap_with_arg func_trap "$monitor_pid" SIGINT SIGTERM SIGKILL
-		KILL -SIGSTOP $$
+		trap_with_arg func_trap "$monitor_pid" SIGINT SIGTERM
+		mwan3_wait_route_monitor "$monitor_pid" "$group" || {
+			kill "$monitor_pid" 2>/dev/null
+			exit 1
+		}
+		mwan3_rtmon_update initial
 		while IFS='' read -r line; do
 			[ -z "${line##*table*}" ] && continue
 			LOG debug "handling route update $family '$line'"
-			mwan3_rtmon_route_handle "$line" "$family"
+			mwan3_rtmon_update event "$line"
 		done
 	} &
 	child=$!
-	trap_with_arg func_trap "$child" SIGINT SIGTERM SIGKILL
-	mwan3_set_connected_${family}
-	mwan3_add_all_routes ${family}
-	kill -SIGCONT $child
-	wait $child
+	trap_with_arg func_trap "$child" SIGINT SIGTERM
+	wait "$child"
 }
 main "$@"
