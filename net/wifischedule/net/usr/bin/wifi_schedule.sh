@@ -316,19 +316,13 @@ _load_modules()
 # Prints: `phy0-ap0$'\n'phy0-ap1$'\n'`
 _wifi_get_interfaces() { iwinfo | awk '/[^[:alnum:]]ESSID[^[:alnum:]]/ { print $1 }' ;}
 
-# Prints: `radio0$'\n'radio1$'\n'`
-_wifi_get_devices() { uci show "wireless" | awk -F= '$2 == "wifi-device" { n = split($1, a, "."); print a[n] }' ;}
-
 _wifi_rfkill_set_all_to()
 {
     local status="$1"
     _arith_bool $(( status == 0 || status == 1 )) || return 1
-    for radio in $(_wifi_get_devices)
-    do
-        uci set "wireless.${radio}.disabled=${status}" || return
-    done
-    uci commit wireless || return
-    /sbin/wifi
+    /usr/libexec/wifischedule-rfkill "$status" || return
+    # Automatic state changes must not activate another writer's saved edits.
+    ubus call network.wireless reload
 }
 
 _wifi_rfkill_unblock_all() { _wifi_rfkill_set_all_to 0 ;}

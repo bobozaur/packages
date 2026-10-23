@@ -16,7 +16,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=wifischedule
 PKG_VERSION:=1.1.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=PRPL
 
 PKG_MAINTAINER:=Nils Koenig <openwrt@newk.it> 
@@ -28,7 +28,8 @@ define Package/wifischedule
   TITLE:=Turns WiFi on and off according to a schedule
   SECTION:=net
   CATEGORY:=Network
-  PKGARCH:=all
+  DEPENDS:=+uci +libuci +ubus +wifi-scripts
+  EXTRA_DEPENDS:=libuci (>=2025.12.02~66127cd7-r2), wifi-scripts (>=1.0-r13)
 endef
 
 define Package/wifischedule/description
@@ -40,15 +41,21 @@ define Package/wifischedule/conffiles
 endef
 
 define Build/Prepare
+	$(INSTALL_DIR) $(PKG_BUILD_DIR)
+	$(CP) ./src/* $(PKG_BUILD_DIR)/
 endef
 
 define Build/Configure
 endef
 
 define Build/Compile
+	$(TARGET_CC) $(TARGET_CPPFLAGS) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
+		-o $(PKG_BUILD_DIR)/wifischedule-rfkill $(PKG_BUILD_DIR)/rfkill.c -luci
 endef
 
 define Package/wifischedule/install
+	$(INSTALL_DIR) $(1)/usr/libexec
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/wifischedule-rfkill $(1)/usr/libexec/wifischedule-rfkill
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) ./net/usr/bin/wifi_schedule.sh $(1)/usr/bin/wifi_schedule.sh
 	$(INSTALL_DIR) $(1)/usr/share/wifischedule

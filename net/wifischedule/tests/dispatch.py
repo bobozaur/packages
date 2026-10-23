@@ -1,8 +1,8 @@
 #!/usr/bin/python3
 """Run with the product CLI/helper and command doubles mounted in a container.
 
-The test executes the unchanged public CLI. /sbin/wifi is a required command
-double; no test may control real radios, crontabs, UCI configuration or locks.
+The test executes the public CLI. The native RF-kill updater is a required
+command double; no test may control real radios, crontabs, UCI configuration or locks.
 """
 import json
 import os
@@ -12,9 +12,9 @@ import subprocess
 ROOT = Path('/state')
 SCRIPT = '/usr/bin/wifi_schedule.sh'
 MOCK = Path('/tests/mock-command.py')
-assert Path('/sbin/wifi').read_bytes() == MOCK.read_bytes(), 'isolated mock required'
+assert Path('/usr/libexec/wifischedule-rfkill').read_bytes() == MOCK.read_bytes(), 'isolated native updater required'
 (ROOT / 'bin').mkdir(exist_ok=True)
-for command in ('uci', 'date', 'crontab', 'iwinfo', 'lock', 'service', 'logger'):
+for command in ('uci', 'date', 'crontab', 'iwinfo', 'lock', 'service', 'logger', 'ubus'):
     path = ROOT / 'bin' / command
     if not path.exists():
         path.symlink_to(MOCK)
@@ -50,12 +50,12 @@ def invoke(state, *args, status=0):
     events = [json.loads(line) for line in (ROOT / 'events.jsonl').read_text().splitlines()]
     unlocks = [x for x in events if x[:2] == ['lock', '-u']]
     assert len(unlocks) == (0 if state.get('lock_failure') else 1), events
-    assert all(x == ['uci', 'commit', 'wireless'] for x in events if x[:2] == ['uci', 'commit'])
+    assert not any(x[:2] == ['uci', 'commit'] for x in events), events
     return json.loads((ROOT / 'state.json').read_text()), events
 
 
 def changed(events):
-    return any(x[0] == 'wifi' or x[:2] == ['uci', 'set'] for x in events)
+    return any(x[0] == 'wifischedule-rfkill' or x[:2] == ['uci', 'set'] for x in events)
 
 
 # Cron generation and startup agree on overnight/week rollover and H:M input.

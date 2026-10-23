@@ -57,7 +57,12 @@ elif command == 'iwinfo':
 elif command == 'lock':
     if args[0] != '-u' and state.get('lock_failure'):
         sys.exit(1)
-elif command == 'wifi':
+elif command == 'wifischedule-rfkill':
+    assert args in (['0'], ['1']), args
+    for radio in ('radio0', 'radio1'):
+        state['config'][f'wireless.{radio}.disabled'] = args[0]
+elif command == 'ubus':
+    assert args == ['call', 'network.wireless', 'reload'], args
     if state.get('wifi_failure'):
         sys.exit(7)
 elif command == 'service':
@@ -71,5 +76,5 @@ elif command != 'logger':
     raise AssertionError(command)
 
 # Read-only commands must not overwrite concurrent crontab pipeline updates.
-if (command == 'uci' and args[0] == 'set') or (command == 'crontab' and args == ['-']) or command == 'service':
+if (command == 'uci' and args[0] == 'set') or (command == 'crontab' and args == ['-']) or command in ('service', 'wifischedule-rfkill'):
     (root / 'state.json').write_text(json.dumps(state))
