@@ -111,3 +111,10 @@ CLI cases run through `sh tests/run-dispatch.sh IMAGE`, where IMAGE supplies Bas
 Python 3 and standard text tools. The runner mounts the product files unchanged
 and substitutes external commands in a container without network access; it
 cannot modify host or router radios, UCI, crontabs or locks.
+
+Automatic radio transitions update only the committed `wifi-device.disabled`
+values under the native UCI package lock and reload committed wireless state.
+Saved CLI/LuCI edits remain pending, including other edits in `wireless`;
+automatic scheduling does not apply them. Explicit user Apply retains its normal
+configuration behavior. The package requires the libuci conditional-update lock
+and wifi-scripts committed wireless reload contracts declared in its dependencies.

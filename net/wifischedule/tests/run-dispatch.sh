@@ -10,7 +10,7 @@ docker run --rm --read-only --network none --cap-drop ALL \
     --mount "type=bind,src=$base/tests,dst=/tests,readonly" \
     --mount "type=bind,src=$base/net/usr/bin/wifi_schedule.sh,dst=/usr/bin/wifi_schedule.sh,readonly" \
     --mount "type=bind,src=$base/net/usr/share/wifischedule,dst=/usr/share/wifischedule,readonly" \
-    --mount "type=bind,src=$base/tests/mock-command.py,dst=/sbin/wifi,readonly" \
+    --mount "type=bind,src=$base/tests/mock-command.py,dst=/usr/libexec/wifischedule-rfkill,readonly" \
     --mount "type=bind,src=$state,dst=/state" \
     --mount "type=bind,src=$state/crontabs,dst=/etc/crontabs" \
     --entrypoint python3 "$image" /tests/dispatch.py
