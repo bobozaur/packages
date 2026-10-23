@@ -18,6 +18,8 @@
 
 set -o pipefail
 
+. /usr/share/wifischedule/time.sh
+
 
 SCRIPT="$0"
 PACKAGE="wifi_schedule"
@@ -54,7 +56,6 @@ _log()
 
 _exit()
 {
-    lock -u "${LOCKFILE}"
     exit "$1"
 }
 
@@ -86,83 +87,85 @@ _cfg_global_is_unload_modules_enabled()
 # Prints: `entry1_name$'\n'entry2_name$'\n'...`
 _cfg_list_entries()
 {
-    uci show "${PACKAGE}" | awk -F= '$2 == "entry" { n = split($1, a, "."); print a[n] }'
+    # Positional aliases can select a different entry after another is removed.
+    uci -X show "${PACKAGE}" | awk -F= '$2 == "entry" { n = split($1, a, "."); print a[n] }'
 }
 
 _cfg_entry_is_enabled() {
-    local value
-    value="$(_uci_get_value "${PACKAGE}.${entry}.enabled")"
+    local entry="$1" value
+    [ "$(_uci_get_value "${PACKAGE}.${entry}")" = entry ] || return 1
+    value="$(_uci_get_value "${PACKAGE}.${entry}.enabled")" || return 1
     _uci_bool "${value}"
 }
 
 _cfg_entry_is_now_within_timewindow()
 {
-    local entry="$1"
-    local starttime stoptime daysofweek
-    local nowdow nowhhmm nowts startts stopts
-    starttime=$( _uci_get_value "${PACKAGE}.${entry}.starttime" ) || return 1
-    stoptime=$(  _uci_get_value "${PACKAGE}.${entry}.stoptime"  ) || return 1
+    local entry="$1" nowdow="$2" nowminutes="$3"
+    local starttime stoptime daysofweek startminutes stopminutes days
+    starttime=$(_uci_get_value "${PACKAGE}.${entry}.starttime") || return 1
+    stoptime=$(_uci_get_value "${PACKAGE}.${entry}.stoptime") || return 1
     daysofweek=$(_uci_get_value "${PACKAGE}.${entry}.daysofweek") || return 1
-
-    # check if day of week matches today
-    nowdow="$(date +%A)"
-    echo "${daysofweek}" | grep -q "${nowdow}" || return 1
-
-    nowhhmm="$(date "+%H:%M")"
-    nowts=$(  date -u +%s -d "${nowhhmm}")
-    startts=$(date -u +%s -d "${starttime}")
-    stopts=$( date -u +%s -d "${stoptime}")
-    # add a day if stopts goes past midnight
-    stopts=$(( stopts < startts ? stopts + 86400 : stopts ))
-
-    _arith_bool $(( nowts >= startts && nowts < stopts ))
+    startminutes=$(schedule_time_minutes "$starttime") || return 1
+    stopminutes=$(schedule_time_minutes "$stoptime") || return 1
+    days=$(schedule_weekdays 0 $daysofweek) || return 1
+    schedule_window_active "$startminutes" "$stopminutes" "$days" "$nowdow" "$nowminutes"
 }
 
 _cfg_can_wifi_run_now()
 {
-    local entry
+    local entry now nowdow nowminutes
+    now=$(date '+%w %H:%M') || return 1
+    nowdow="${now%% *}"
+    nowminutes=$(schedule_time_minutes "${now#* }") || return 1
     for entry in $(_cfg_list_entries)
     do
         test -n "${entry}" || continue
         _cfg_entry_is_enabled "${entry}" || continue
-        _cfg_entry_is_now_within_timewindow "${entry}" && return 0
+        _cfg_entry_is_now_within_timewindow "${entry}" "$nowdow" "$nowminutes" && return 0
     done
     return 1
 }
 
-_cron_restart() { service cron restart > /dev/null ;}
+# crontab writes cron.update for the running daemon. Restarting its service
+# from a cron job kills the job itself; starting after a file change may also
+# replace the procd instance, so only start an absent daemon.
+_cron_update() { service cron running >/dev/null 2>&1 || service cron start >/dev/null; }
 
-# shellcheck disable=SC2312
-_crontab_append_line() { (crontab -l ; printf "%s\n" "$(_join_by_char ' ' "$@")") | crontab - ;}
+# The privileged OpenWrt crontab is optional until first use. Read it completely
+# before a write so a real read failure cannot replace existing jobs with empty input.
+_crontab_read() { crontab -l 2>/dev/null || [ ! -e /etc/crontabs/root ]; }
+
+_crontab_append_line()
+{
+    local current
+    current=$(_crontab_read) || return
+    { [ -z "$current" ] || printf '%s\n' "$current"
+      printf '%s\n' "$(_join_by_char ' ' "$@")"
+    } | crontab -
+}
 
 ## Usage: _crontab_rm_script_entries_by_arg          # this removes all script entries
 ## Usage: _crontab_rm_script_entries_by_arg recheck  # this removes just entries with recheck argument
 _crontab_rm_script_entries_by_arg()
 {
-    # this loop will create regexp that looks like this:
-    #
-    #     ^\b${SCRIPT}\b\s+\b${@}\b
-    #
-    local regex="(:?^|[[:space:]])${SCRIPT}"
-    local arg
-    for arg in "$@"
-    do
-        regex="${regex}[[:space:]]+${arg}"
-    done
-    regex="${regex}(:?$|[[:space:]])"
-
-    crontab -l | awk -v cmd_col_pos=6 -v regex="${regex}" '
+    local current
+    current=$(_crontab_read) || return
+    # Compare literal command words, including anonymous UCI names containing
+    # brackets. A nice prefix is permitted; comments and environment stay intact.
+    { [ -z "$current" ] || printf '%s\n' "$current"; } |
+    awk -v script="$SCRIPT" -v args="$*" -v count="$#" '
+        BEGIN { split(args, wanted, " ") }
         {
-            is_blank_or_comment = $0 ~ /^[[:space:]]*(:?#.*)?$/
-            is_env_var          = $0 ~ /^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*=.*$/
-
-            # find index of the cmdline cell start
-            match($0, "[[:space:]]*([^[:space:]]+[[:space:]]+){" cmd_col_pos - 1 "}")
-            # get the cmdline cell
-            cmdline = substr($0, RLENGTH + 1)
-
-            if ( is_blank_or_comment || is_env_var || cmdline !~ regex )
-                print
+            remove = 0
+            if ($0 !~ /^[[:space:]]*(#|[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*=)/)
+                for (i = 6; i <= NF; i++)
+                    if ($i == script) {
+                        matches = 1
+                        for (j = 1; j <= count; j++)
+                            if ($(i + j) != wanted[j]) matches = 0
+                        if (matches) remove = 1
+                    }
+            if (!remove) print
         }' | crontab -
 }
 
@@ -175,18 +178,15 @@ _crontab_add_from_cfg_entry()
     daysofweek=$(   _uci_get_value "${PACKAGE}.${entry}.daysofweek") || return 1
     forcewifidown=$(_uci_get_value "${PACKAGE}.${entry}.forcewifidown")
     
-    # parse `HH:MM` to `Xhh` and `Xmm` variables
-    local starthh stophh startmm stopmm
-    starthh=$(echo "${starttime}" | cut -c 1-2) startmm=$(echo "${starttime}" | cut -c 4-5) || true
-    stophh=$( echo "${stoptime}"  | cut -c 1-2) stopmm=$( echo "${stoptime}"  | cut -c 4-5) || true
+    local startminutes stopminutes fdow stopdow offset=0
+    startminutes=$(schedule_time_minutes "$starttime") || return 1
+    stopminutes=$(schedule_time_minutes "$stoptime") || return 1
+    fdow=$(schedule_weekdays 0 $daysofweek) || return 1
+    [ "$stopminutes" -ge "$startminutes" ] || offset=1
+    stopdow=$(schedule_weekdays "$offset" $daysofweek) || return 1
 
-    local fdow
-    # shellcheck disable=SC2046,SC2086
-    fdow=$(_join_by_char "," $(printf "%.3s\n" ${daysofweek}))
-
-    if [ "${starttime}" != "${stoptime}" ]
-    then
-        _crontab_append_line "${startmm} ${starthh} * * ${fdow} ${SCRIPT} start ${entry}"
+    if [ "$startminutes" -ne "$stopminutes" ]; then
+        _crontab_append_line "$((startminutes % 60)) $((startminutes / 60)) * * ${fdow} ${SCRIPT} start entry:${entry}" || return
     fi
 
     local stopmode="stop"
@@ -194,23 +194,37 @@ _crontab_add_from_cfg_entry()
         stopmode="forcestop"
     fi
 
-    _crontab_append_line "${stopmm} ${stophh} * * ${fdow} ${SCRIPT} ${stopmode} ${entry}"
+    _crontab_append_line "$((stopminutes % 60)) $((stopminutes / 60)) * * ${stopdow} ${SCRIPT} ${stopmode} entry:${entry}" || return
 
     return 0
 }
 
 _crontab_reset_from_cfg()
 {
-    _crontab_rm_script_entries_by_arg
+    local retries="" current
+    if [ "$1" = preserve_rechecks ]; then
+        # Explicit origins remain valid requests across an upgrade. The first
+        # invocation revalidates named entries; unowned legacy retries are lost.
+        current=$(_crontab_read) || return
+        retries=$(printf '%s\n' "$current" | awk -v script="$SCRIPT" '
+            $0 !~ /^[[:space:]]*(#|[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*=)/ {
+                if (NF >= 8 && $(NF - 2) == script && $(NF - 1) == "recheck" && ($NF == "manual" || $NF ~ /^entry:[^@]/))
+                    print
+            }')
+    fi
+    _crontab_rm_script_entries_by_arg || return
+    if [ -n "$retries" ]; then
+        _crontab_append_line "$retries" || return
+    fi
 
-    _cfg_global_is_enabled || return
+    _cfg_global_is_enabled || return 0
 
     local entry
     for entry in $(_cfg_list_entries)
     do
         test -n "${entry}" || continue
         _cfg_entry_is_enabled "${entry}" || continue
-        _crontab_add_from_cfg_entry "${entry}"
+        _crontab_add_from_cfg_entry "${entry}" || return
     done
 }
 
@@ -311,9 +325,9 @@ _wifi_rfkill_set_all_to()
     _arith_bool $(( status == 0 || status == 1 )) || return 1
     for radio in $(_wifi_get_devices)
     do
-        uci set "wireless.${radio}.disabled=${status}"
+        uci set "wireless.${radio}.disabled=${status}" || return
     done
-    uci commit
+    uci commit wireless || return
     /sbin/wifi
 }
 
@@ -322,9 +336,9 @@ _wifi_rfkill_block_all()   { _wifi_rfkill_set_all_to 1 ;}
 
 wifi_disable()
 {
-    _crontab_rm_script_entries_by_arg "recheck"
-    _cron_restart
-    _wifi_rfkill_block_all
+    _crontab_rm_script_entries_by_arg "recheck" || return
+    _cron_update || return
+    _wifi_rfkill_block_all || return
     if _cfg_global_is_unload_modules_enabled
     then
         _unload_modules
@@ -333,6 +347,7 @@ wifi_disable()
 
 wifi_soft_disable()
 {
+    local origin="${1:-manual}"
     if ! command -v iwinfo >/dev/null 2>&1 ; then
         _log "info" "iwinfo not available, skipping"
         return 1
@@ -373,33 +388,28 @@ wifi_soft_disable()
         fi
     done
 
-    _crontab_rm_script_entries_by_arg "recheck"
+    _crontab_rm_script_entries_by_arg "recheck" "$origin" || return
 
     if [ "${has_assoc}" = "false" ]
     then
-        if _cfg_can_wifi_run_now
-        then
-            _log "info" "Do not disable wifi since there is an allow timewindow, skip rechecking."
-        else
-            _log "notice" "No stations associated, disable wifi."
-            wifi_disable
-        fi
+        _log "notice" "No stations associated, disable wifi."
+        wifi_disable || return
     else
         _log "notice" "Could not disable wifi due to associated stations, retrying..."
         local recheck_interval
         recheck_interval=$(_uci_get_value "${GLOBAL}.recheck_interval")
         if test -n "${recheck_interval}" && _arith_bool $(( recheck_interval > 0 )) ; then
-            _crontab_append_line "*/${recheck_interval} * * * * /bin/nice -n 19 ${SCRIPT} recheck"
+            _crontab_append_line "*/${recheck_interval} * * * * /bin/nice -n 19 ${SCRIPT} recheck ${origin}" || return
         fi
     fi
 
-    _cron_restart
+    _cron_update
 }
 
 wifi_enable()
 {
-    _crontab_rm_script_entries_by_arg "recheck"
-    _cron_restart
+    _crontab_rm_script_entries_by_arg "recheck" || return
+    _cron_update || return
     if _cfg_global_is_unload_modules_enabled
     then
         _load_modules
@@ -409,7 +419,7 @@ wifi_enable()
 
 wifi_startup()
 {
-    _cfg_global_is_enabled || return
+    _cfg_global_is_enabled || return 0
 
     if _cfg_can_wifi_run_now
     then
@@ -421,13 +431,54 @@ wifi_startup()
     fi
 }
 
+# Cron supplies an entry name; LuCI and standalone commands use manual control.
+# An old cron verb never overrides current configuration or another allow window.
+wifi_scheduled_action()
+{
+    local action="$1" origin="$2" entry force
+    case "$origin" in
+        entry:*) entry="${origin#entry:}" ;;
+        *)
+            # Queued pre-upgrade jobs lack an unambiguous entry identity.
+            for action in start stop forcestop recheck; do
+                _crontab_rm_script_entries_by_arg "$action" "$origin" || return
+            done
+            _cron_update
+            return
+            ;;
+    esac
+    if ! _cfg_global_is_enabled || ! _cfg_entry_is_enabled "$entry"; then
+        _crontab_rm_script_entries_by_arg recheck "$origin" || return
+        _cron_update
+        return
+    fi
+
+    if _cfg_can_wifi_run_now; then
+        if [ "$action" = start ]; then
+            wifi_enable
+        else
+            _crontab_rm_script_entries_by_arg recheck "$origin" || return
+            _cron_update
+        fi
+        return
+    fi
+    [ "$action" != start ] || return 0
+    force=$(_uci_get_value "${PACKAGE}.${entry}.forcewifidown") || return 1
+    if _uci_bool "$force"; then
+        wifi_disable
+    else
+        wifi_soft_disable "$origin"
+    fi
+}
+
 usage()
 {
-    echo "$0 cron|start|startup|stop|forcestop|recheck|getmodules|savemodules|help"
+    echo "$0 cron|cron-only|start|startup|stop|forcestop|recheck|getmodules|savemodules|help"
     echo ""
     echo "    UCI Config File: /etc/config/${PACKAGE}"
     echo ""
     echo "    cron: Create cronjob entries."
+    echo "    cron-only: Rebuild cron jobs without changing the current radio state."
     echo "    start: Start wifi."
     echo "    startup: Checks current timewindow and enables/disables WIFI accordingly."
     echo "    stop: Stop wifi gracefully, i.e. check if there are stations associated and if so keep retrying."
@@ -443,36 +494,50 @@ usage()
 _cleanup()
 {
     lock -u "${LOCKFILE}"
-    rm "${LOCKFILE}"
 }
 
 ###############################################################################
 # MAIN
 ###############################################################################
 main() {
-    trap _cleanup EXIT
+    local status
 
     LOGGING=$(_uci_get_value "${GLOBAL}.logging") || _exit 1
     _log "info" "${SCRIPT}" "$@"
-    lock "${LOCKFILE}"
+    lock "${LOCKFILE}" || _exit 1
+    # Unlock exactly once, after acquisition. Keep the inode for queued owners.
+    trap _cleanup EXIT
+    trap '_exit 1' HUP INT TERM
 
     case "$1" in
-        cron)
-            _crontab_reset_from_cfg
-            _cron_restart
-            wifi_startup
+        cron-only)
+            _crontab_reset_from_cfg preserve_rechecks && _cron_update
             ;;
-        start) wifi_enable ;;
+        cron)
+            _crontab_reset_from_cfg && _cron_update && wifi_startup
+            ;;
+        start|stop|forcestop|recheck)
+            if [ "$1" = recheck ] && [ -z "$2" ]; then
+                # Old ownerless retries must not acquire manual authority.
+                _crontab_rm_script_entries_by_arg recheck "" && _cron_update
+            elif [ "${2:-manual}" != manual ]; then
+                wifi_scheduled_action "$1" "$2"
+            else
+                case "$1" in
+                    start) wifi_enable ;;
+                    forcestop) wifi_disable ;;
+                    stop|recheck) wifi_soft_disable manual ;;
+                esac
+            fi
+            ;;
         startup) wifi_startup ;;
-        forcestop) wifi_disable ;;
-        stop) wifi_soft_disable ;;
-        recheck) wifi_soft_disable ;;
         getmodules) get_module_list ;;
         savemodules) save_module_list_uci ;;
         help|--help|-h|*) usage ;;
     esac
 
-    _exit 0
+    status=$?
+    _exit "$status"
 }
 
 main "${@}"
